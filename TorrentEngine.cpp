@@ -289,8 +289,16 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                     }
 
                     int current_piece = (state.file_offset + current_byte) / state.piece_length;
-                    int window_size = 6;
                     
+		    // Target 15 Megabytes of active buffer
+                    std::int64_t target_buffer_bytes = 15 * 1024 * 1024; 
+
+                    // Calculate how many pieces are needed to reach 15MB
+                    int dynamic_window = static_cast<int>(target_buffer_bytes / state.piece_length);
+
+                    // Clamp it so it never drops below 4 pieces, and never exceeds 12 pieces
+		    int window_size = std::clamp(dynamic_window, 4, 12);
+		                        
                     wm->update(current_piece, current_piece + window_size); 
 
                     while (!state.h.have_piece(lt::piece_index_t(current_piece))) {
