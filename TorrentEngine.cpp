@@ -31,6 +31,7 @@
 #include <memory>
 #include <atomic>
 #include <ctime>
+#include <algorithm> // Required for std::clamp
 
 // --- THREAD-SAFE DEBUG LOGGER ---
 std::mutex g_log_mtx;
@@ -115,7 +116,7 @@ struct WindowManager {
         for(int p : active_window) {
             if (!state.h.have_piece(lt::piece_index_t(p))) {
                 
-                // THE FIX: Sliding Priority. 
+                // Sliding Priority. 
                 // Piece 0 gets priority 7. Piece 1 gets 6. Fades down to a minimum of 1.
                 int prio_val = std::max(1, 7 - (p - start_p));
                 state.h.piece_priority(lt::piece_index_t(p), lt::download_priority_t(static_cast<uint8_t>(prio_val)));
@@ -204,31 +205,90 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
         h.piece_priority(lt::piece_index_t(p), lt::dont_download);
     }
     
+    std::string playlist_path = state.file_path + ".m3u8";
+
     if (selected_path.length() >= 5 && selected_path.substr(selected_path.length() - 5) == ".m2ts") {
-        std::string clpi_path = selected_path;
-        size_t pos = clpi_path.find("STREAM");
-        if (pos != std::string::npos) clpi_path.replace(pos, 6, "CLIPINF");
-        pos = clpi_path.find(".m2ts");
-        if (pos != std::string::npos) clpi_path.replace(pos, 5, ".clpi");
+        
+        // 1. Check if we already did this math in a previous session
+        if (file_exists(playlist_path)) {
+            std::cout << "\n[*] Found cached HLS playlist on disk. Skipping index download...\n";
+            std::ifstream ifs(playlist_path);
+            hls_playlist.assign((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+            write_debug_log(debug, "[HLS] Loaded existing playlist from: " + playlist_path);
+        } 
+        else {
+            // 2. Generate a new playlist
+            std::string clpi_path = selected_path;
+            size_t pos = clpi_path.find("STREAM");
+            if (pos != std::string::npos) clpi_path.replace(pos, 6, "CLIPINF");
+            pos = clpi_path.find(".m2ts");
+            if (pos != std::string::npos) clpi_path.replace(pos, 5, ".clpi");
 
-        int clpi_idx = -1;
-        for (int i = 0; i < files.num_files(); ++i) {
-            if (files.file_path(i) == clpi_path) { clpi_idx = i; break; }
-        }
-
-        if (clpi_idx != -1) {
-            priorities[clpi_idx] = lt::top_priority;
-            h.prioritize_files(priorities);
-            std::vector<std::int64_t> fp;
-            while(true) {
-                h.file_progress(fp);
-                if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(clpi_idx)) break;
-                if (interrupted) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            int clpi_idx = -1;
+            for (int i = 0; i < files.num_files(); ++i) {
+                if (files.file_path(i) == clpi_path) { clpi_idx = i; break; }
             }
-            std::string full_clpi = config.save_dir + "/" + files.file_path(clpi_idx);
-            auto m_idx = parse_clpi_file(full_clpi);
-            if (!m_idx.empty()) hls_playlist = generate_hls(m_idx, state.file_size, config.port);
+
+            if (clpi_idx != -1) {
+                priorities[clpi_idx] = lt::top_priority;
+                h.prioritize_files(priorities);
+                
+                int clpi_first_p = files.file_offset(clpi_idx) / state.piece_length;
+                int clpi_last_p = (files.file_offset(clpi_idx) + files.file_size(clpi_idx) - 1) / state.piece_length;
+                
+                std::cout << "\n[*] Downloading Blu-ray index (.clpi) for HLS generation...\n";
+                
+                std::vector<std::int64_t> fp;
+                int retry_counter = 0;
+                
+                while(true) {
+                    h.file_progress(fp);
+                    
+                    if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(clpi_idx)) {
+                        std::cout << "\n[*] Index downloaded successfully.\n";
+                        break;
+                    }
+                    if (interrupted) {
+                        std::cout << "\n[-] Stream aborted by user.\n";
+                        break;
+                    }
+                    
+                    if (fp.size() > clpi_idx && files.file_size(clpi_idx) > 0) {
+                        double clpi_prog = (static_cast<double>(fp[clpi_idx]) / static_cast<double>(files.file_size(clpi_idx))) * 100.0;
+                        std::cout << "\r[>] Index Progress: " << std::fixed << std::setprecision(2) << clpi_prog << "%   " << std::flush;
+                    }
+                    
+                    // The "Re-Ask" Mechanism: Every 5 seconds, aggressively re-assert deadlines
+                    if (++retry_counter % 25 == 0) { 
+                        for (int p = clpi_first_p; p <= clpi_last_p; ++p) {
+                            h.piece_priority(lt::piece_index_t(p), lt::top_priority);
+                            h.set_piece_deadline(lt::piece_index_t(p), 1000); 
+                        }
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+
+                // 3. Parse and cache to disk
+                if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(clpi_idx)) {
+                    std::cout << "[*] Parsing index and caching HLS playlist to disk...\n";
+                    std::string full_clpi = config.save_dir + "/" + files.file_path(clpi_idx);
+                    auto m_idx = parse_clpi_file(full_clpi);
+                    
+                    if (!m_idx.empty()) {
+                        hls_playlist = generate_hls(m_idx, state.file_size, config.port);
+                        
+                        std::ofstream ofs(playlist_path);
+                        if (ofs.is_open()) {
+                            ofs << hls_playlist;
+                            ofs.close();
+                            write_debug_log(debug, "[HLS] Successfully saved playlist to: " + playlist_path);
+                        } else {
+                            write_debug_log(debug, "[HLS] ERROR: Failed to write playlist to disk.");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -290,15 +350,15 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 
                     int current_piece = (state.file_offset + current_byte) / state.piece_length;
                     
-		    // Target 15 Megabytes of active buffer
+                    // Target 15 Megabytes of active buffer
                     std::int64_t target_buffer_bytes = 15 * 1024 * 1024; 
 
                     // Calculate how many pieces are needed to reach 15MB
                     int dynamic_window = static_cast<int>(target_buffer_bytes / state.piece_length);
 
                     // Clamp it so it never drops below 4 pieces, and never exceeds 12 pieces
-		    int window_size = std::clamp(dynamic_window, 4, 12);
-		                        
+                    int window_size = std::clamp(dynamic_window, 4, 12);
+                                        
                     wm->update(current_piece, current_piece + window_size); 
 
                     while (!state.h.have_piece(lt::piece_index_t(current_piece))) {
@@ -363,15 +423,14 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
         lt::torrent_status st = h.status();
         
         std::vector<std::int64_t> fp;
-        h.file_progress(fp); // FIXED PROGRESS BUG HERE: Removed piece_granularity flag
+        h.file_progress(fp); // Removed piece_granularity flag
         
         double actual_progress = 0.0;
         if (!fp.empty() && choice < fp.size() && state.file_size > 0) {
             actual_progress = (static_cast<double>(fp[choice]) / static_cast<double>(state.file_size)) * 100.0;
         }
 
-        // THE FIX: Standard forward iterator. Now that old pieces are killed quickly,
-        // this cleanly prints the new pieces from Lowest (Current Position) to Highest (Buffer End)
+        // Standard forward iterator for pieces
         std::string active_pieces = "[";
         int count = 0;
         {
@@ -530,5 +589,3 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         stream_file(ses, config, h, ti, choice, resume_file_path);
     }
 }
-
-
