@@ -289,7 +289,7 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                     }
 
                     int current_piece = (state.file_offset + current_byte) / state.piece_length;
-                    int window_size = 20;
+                    int window_size = 6;
                     
                     wm->update(current_piece, current_piece + window_size); 
 
