@@ -23,8 +23,8 @@ A high-performance, multi-threaded BitTorrent streaming engine built in C++. Thi
 
 ```bash
 # Clone the repository
-git clone [https://github.com/](https://github.com/)<YOUR_USERNAME>/<YOUR_REPO_NAME>.git
-cd <YOUR_REPO_NAME>
+git clone https://github.com/marwanikolo/torrent-streamer-cpp.git
+cd torrent-streamer-cpp
 
 # Create build directory
 mkdir build && cd build
