@@ -1,0 +1,16 @@
+# Build directory
+build/
+
+# Logs
+streamer_debug.log
+
+# Torrent and Media files
+*.torrent
+*.fastresume
+*.mp4
+*.mkv
+*.avi
+*.m2ts
+*.clpi
+*.m3u8
+Over Your Dead Body*
