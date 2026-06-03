@@ -304,8 +304,9 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 
                     if (state.shutting_down) return false;
                     
+                    // FIXED OVERFLOW BUG HERE: Cast `current_piece + 1` to 64-bit int BEFORE multiplication
                     std::int64_t piece_end_byte = std::min(
-                        static_cast<std::int64_t>(((current_piece + 1) * state.piece_length) - state.file_offset - 1),
+                        (static_cast<std::int64_t>(current_piece + 1) * state.piece_length) - state.file_offset - 1,
                         state.file_size - 1
                     );
 
@@ -354,7 +355,8 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
         lt::torrent_status st = h.status();
         
         std::vector<std::int64_t> fp;
-        h.file_progress(fp, lt::torrent_handle::piece_granularity);
+        h.file_progress(fp); // FIXED PROGRESS BUG HERE: Removed piece_granularity flag
+        
         double actual_progress = 0.0;
         if (!fp.empty() && choice < fp.size() && state.file_size > 0) {
             actual_progress = (static_cast<double>(fp[choice]) / static_cast<double>(state.file_size)) * 100.0;
@@ -520,3 +522,5 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         stream_file(ses, config, h, ti, choice, resume_file_path);
     }
 }
+
+
