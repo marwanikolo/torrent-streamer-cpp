@@ -5,6 +5,7 @@ A high-performance, multi-threaded BitTorrent streaming engine built in C++. Thi
 ## ✨ Features
 
 * **Lightning-Fast Sequential Streaming:** Built on `libtorrent-rasterbar`, forcing sequential piece downloading for instant playback.
+* **Zero-Latency Active Kill Seeking (MPV):** Uses a dynamically injected Lua script to provide out-of-band signaling via a dedicated REST endpoint. This proactively kills obsolete HTTP worker threads the millisecond you seek, preventing BitTorrent "phantom priority deadlocks" and instantly redirecting swarm bandwidth to your new playback position.
 * **Smart Sliding Piece Priorities:** Dynamically assigns `libtorrent` piece priorities (7 down to 1) and enforces time-critical deadlines (200ms) for the immediate playback head, preventing swarm choking.
 * **Multi-Threaded HTTP Range Server:** Powered by `cpp-httplib` with a 64-thread pool. Natively handles HTTP `Range` requests, allowing perfect seeking without breaking socket connections.
 * **Blu-Ray Instant Seeking (HLS):** Automatically detects `.m2ts` files, downloads their associated `.clpi` index maps, and generates a virtual `#EXTM3U` HLS playlist in RAM to allow instant, skip-free seeking across massive Blu-ray structures.
@@ -17,6 +18,7 @@ A high-performance, multi-threaded BitTorrent streaming engine built in C++. Thi
 * **CMake** (Build system)
 * **libtorrent-rasterbar** (v2.0+)
 * **cpp-httplib** (Header-only HTTP server)
+* **curl** (Required for MPV out-of-band seek signaling)
 * **mpv** or **VLC** (For playback)
 
 ## 🚀 Building from Source
