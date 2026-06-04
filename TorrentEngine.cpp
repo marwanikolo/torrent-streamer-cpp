@@ -110,7 +110,8 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         std::cout << "============================================================\n";
         
         // FIX: libtorrent 2.x deprecation fix for ti->files()
-        lt::file_storage const& files = ti->orig_files();
+        lt::file_storage const& files = ti->files();
+	
         for (int i = 0; i < files.num_files(); ++i) {
             std::cout << " [" << i << "] " << files.file_path(lt::file_index_t(i)) 
                       << " (" << files.file_size(lt::file_index_t(i)) / (1024 * 1024) << " MB)\n";

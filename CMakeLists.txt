@@ -1,8 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(TorrentStreamer)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# --- NEW: Fix for CMake 3.30+ FindBoost deprecation warning ---
+# Must go BEFORE LibtorrentRasterbar, since it internally triggers FindBoost
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
 
 # Find necessary system libraries
 find_package(LibtorrentRasterbar REQUIRED)

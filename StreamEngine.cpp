@@ -11,8 +11,9 @@
 #include <thread>
 #include <chrono>
 #include <format>
-#include <iomanip>
+#include <print>     // <--- NEW C++23 Print Library
 #include <algorithm>
+// (Removed <iomanip> as C++23 native formatting handles precision natively)
 
 extern std::atomic<bool> interrupted;
 
@@ -42,9 +43,9 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
     std::string selected_path = files.file_path(lt::file_index_t(choice));
     bool debug = config.debug_mode;
     
-    write_debug_log(debug, std::format("[INIT] Selected File: {} ({} bytes)", selected_path, state.file_size));
+    write_debug_log(debug, "[INIT] Selected File: {} ({} bytes)", selected_path, state.file_size);
     
-    std::cout << "\n[*] Piece Size: " << (state.piece_length / 1024) << " KB | Total Pieces: " << state.num_pieces << "\n";
+    std::println("\n[*] Piece Size: {} KB | Total Pieces: {}", (state.piece_length / 1024), state.num_pieces);
 
     std::vector<lt::download_priority_t> priorities(files.num_files(), lt::default_priority);
     h.prioritize_files(priorities);
@@ -58,7 +59,7 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 
     if (selected_path.length() >= 5 && selected_path.substr(selected_path.length() - 5) == ".m2ts") {
         if (file_exists(playlist_path)) {
-            std::cout << "\n[*] Found cached HLS playlist on disk. Skipping index download...\n";
+            std::println("\n[*] Found cached HLS playlist on disk. Skipping index download...");
             std::ifstream ifs(playlist_path);
             hls_playlist.assign((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
         } 
@@ -81,7 +82,7 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                 int clpi_first_p = files.file_offset(lt::file_index_t(clpi_idx)) / state.piece_length;
                 int clpi_last_p = (files.file_offset(lt::file_index_t(clpi_idx)) + files.file_size(lt::file_index_t(clpi_idx)) - 1) / state.piece_length;
                 
-                std::cout << "\n[*] Downloading Blu-ray index (.clpi) for HLS generation...\n";
+                std::println("\n[*] Downloading Blu-ray index (.clpi) for HLS generation...");
                 
                 std::vector<std::int64_t> fp;
                 int retry_counter = 0;
@@ -90,12 +91,12 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                     h.file_progress(fp);
                     
                     if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(lt::file_index_t(clpi_idx))) {
-                        std::cout << "\n[*] Index downloaded successfully.\n";
+                        std::println("\n[*] Index downloaded successfully.");
                         break;
                     }
                     
                     if (interrupted.load()) {
-                        std::cout << "\n[-] Stream aborted by user. Returning to menu...\n";
+                        std::println("\n[-] Stream aborted by user. Returning to menu...");
                         for (int p = 0; p < state.num_pieces; ++p) h.piece_priority(lt::piece_index_t(p), lt::dont_download);
                         h.clear_piece_deadlines();
                         interrupted = false; 
@@ -105,7 +106,8 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                     
                     if (fp.size() > clpi_idx && files.file_size(lt::file_index_t(clpi_idx)) > 0) {
                         double clpi_prog = (static_cast<double>(fp[clpi_idx]) / static_cast<double>(files.file_size(lt::file_index_t(clpi_idx)))) * 100.0;
-                        std::cout << "\r[>] Index Progress: " << std::fixed << std::setprecision(2) << clpi_prog << "%   " << std::flush;
+                        std::print("\r[>] Index Progress: {:.2f}%   ", clpi_prog);
+                        std::fflush(stdout); // Required when printing to terminal without a newline
                     }
                     
                     if (++retry_counter % 25 == 0) { 
@@ -118,7 +120,7 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                 }
 
                 if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(lt::file_index_t(clpi_idx))) {
-                    std::cout << "[*] Parsing index and caching HLS playlist to disk...\n";
+                    std::println("[*] Parsing index and caching HLS playlist to disk...");
                     std::string full_clpi = config.save_dir + "/" + files.file_path(lt::file_index_t(clpi_idx));
                     auto m_idx = parse_clpi_file(full_clpi);
                     
@@ -134,7 +136,7 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                 }
             }
         }
-    } // <--- THIS WAS THE MISSING BRACE!
+    } 
 
     h.piece_priority(lt::piece_index_t(state.first_piece), lt::top_priority);
     h.piece_priority(lt::piece_index_t(state.last_piece), lt::top_priority);
@@ -143,7 +145,7 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 
     while (!file_exists(state.file_path)) {
         if (interrupted.load()) {
-            std::cout << "\n[-] Stream aborted by user. Returning to menu...\n";
+            std::println("\n[-] Stream aborted by user. Returning to menu...");
             state.shutting_down = true;
             state.cv.notify_all();
             if (alert_thread.joinable()) alert_thread.join();
@@ -169,9 +171,9 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                              std::format("http://localhost:{}/stream", config.port) : 
                              std::format("http://localhost:{}/playlist.m3u8", config.port);
                              
-    std::cout << "\n[*] Launching " << (hls_playlist.empty() ? "raw stream" : "HLS timeline stream") << "...\n";
+    std::println("\n[*] Launching {}...", (hls_playlist.empty() ? "raw stream" : "HLS timeline stream"));
     launch_player(config, launch_url);
-    std::cout << "\n[!] STREAM ACTIVE: Press Ctrl+C to STOP and RETURN TO MENU.\n\n";
+    std::println("\n[!] STREAM ACTIVE: Press Ctrl+C to STOP and RETURN TO MENU.\n");
 
     while (!interrupted.load()) {
         lt::torrent_status st = h.status();
@@ -212,15 +214,15 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
         }
         active_pieces += " ]";
 
-        std::cout << "\r\033[K[>] DL: " << (st.download_rate / 1000) << " kB/s | "
-                  << std::fixed << std::setprecision(2) << actual_progress << "% | "
-                  << "Peers: " << st.num_peers << " (TCP: " << standard_count << " / WebRTC: " << webrtc_count << ") | "
-                  << "Tracked: " << active_pieces << std::flush;
+        // NEW C++23: std::print handles the complex formatting directly
+        std::print("\r\033[K[>] DL: {} kB/s | {:.2f}% | Peers: {} (TCP: {} / WebRTC: {}) | Tracked: {}", 
+                   (st.download_rate / 1000), actual_progress, st.num_peers, standard_count, webrtc_count, active_pieces);
+        std::fflush(stdout);
                   
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    std::cout << "\n\n[*] Stopping player and returning to file menu...\n";
+    std::println("\n\n[*] Stopping player and returning to file menu...");
     
     stop_player();
     h.save_resume_data();
