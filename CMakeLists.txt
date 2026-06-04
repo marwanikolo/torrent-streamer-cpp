@@ -11,10 +11,15 @@ find_package(OpenSSL REQUIRED)
 
 # Define our source files
 set(SOURCES
-    main.cpp
-    ProcessManager.cpp
+    main.cpp 
+    TorrentEngine.cpp 
+    StreamEngine.cpp 
+    WindowManager.cpp
+    AlertHandler.cpp
+    HttpServer.cpp
+    Utils.cpp 
+    ProcessManager.cpp 
     MediaParser.cpp
-    TorrentEngine.cpp
 )
 
 # Create the executable

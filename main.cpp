@@ -13,7 +13,8 @@ void signal_handler(int) { interrupted = true; }
 
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
-
+    std::signal(SIGCHLD, SIG_IGN);
+    
     AppConfig config;
     config.save_dir = "/mnt/LinuxData1/Tordown";
     std::string initial_source = "";
