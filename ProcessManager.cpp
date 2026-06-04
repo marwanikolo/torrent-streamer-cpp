@@ -5,10 +5,25 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <fstream> 
+#include <string>  
 
 pid_t player_pid = -1;
 
 void launch_player(const AppConfig& config, const std::string& stream_url) {
+    
+    // --- NEW: Generate the Active Kill Lua script dynamically ---
+    // We write this to the save_dir so we don't clutter the working directory,
+    // and we inject the correct dynamic port from AppConfig.
+    std::string script_path = config.save_dir + "/seek_hook.lua";
+    std::ofstream lua_file(script_path);
+    if (lua_file.is_open()) {
+        lua_file << "mp.register_event(\"seek\", function()\n";
+        lua_file << "    os.execute(\"curl -s http://localhost:" << config.port << "/abort > /dev/null &\")\n";
+        lua_file << "end)\n";
+        lua_file.close();
+    }
+
     player_pid = fork();
     if (player_pid == 0) {
         // 1. ISOLATE PROCESS GROUP
@@ -37,6 +52,8 @@ void launch_player(const AppConfig& config, const std::string& stream_url) {
         }
 
         if (config.player_path.find("mpv") != std::string::npos) {
+            std::string script_arg = "--script=" + script_path;
+            
             execlp(config.player_path.c_str(), config.player_path.c_str(), 
                    "--cache=yes", 
                    "--force-seekable=yes", 
@@ -44,6 +61,7 @@ void launch_player(const AppConfig& config, const std::string& stream_url) {
                    "--script-opts-append=thumbfast-network=no", 
                    "--demuxer-max-bytes=1024M",                 
                    "--demuxer-max-back-bytes=256M",             
+                   script_arg.c_str(), // <--- Inject the Lua script here
                    stream_url.c_str(), nullptr);
         } 
         else if (config.player_path.find("vlc") != std::string::npos) {

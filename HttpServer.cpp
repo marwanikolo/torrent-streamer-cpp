@@ -13,10 +13,6 @@ void run_http_server(httplib::Server& svr, StreamState& state, const std::string
     bool debug = config.debug_mode;
     
     svr.new_task_queue = [] { return new httplib::ThreadPool(64); };
-    svr.set_read_timeout(1, 0);
-    svr.set_write_timeout(1, 0);
-    svr.set_keep_alive_max_count(1);
-    svr.set_keep_alive_timeout(1);
     
     if (debug) {
         svr.set_logger([debug](const httplib::Request& req, const httplib::Response& res) {
@@ -30,6 +26,13 @@ void run_http_server(httplib::Server& svr, StreamState& state, const std::string
         else res.status = 404;
     });
 
+    // --- NEW: The Active Kill Endpoint ---
+    svr.Get("/abort", [&state, debug](const httplib::Request&, httplib::Response& res) {
+        state.current_request_id++;
+        write_debug_log(debug, "[STRM] ABORT endpoint triggered by Lua hook.");
+        res.set_content("Aborted", "text/plain");
+    });
+
     svr.Get("/stream", [&state, debug](const httplib::Request& req, httplib::Response& res) {
         
         int my_id = ++state.current_request_id;
@@ -41,6 +44,7 @@ void run_http_server(httplib::Server& svr, StreamState& state, const std::string
         else if (ext == "avi") mime_type = "video/x-msvideo";
         else if (ext == "m2ts" || ext == "ts") mime_type = "video/mp2t";
 
+        res.set_header("Connection", "close");
         res.set_header("Accept-Ranges", "bytes");
 
         auto wm = std::make_shared<WindowManager>(state);
@@ -50,9 +54,6 @@ void run_http_server(httplib::Server& svr, StreamState& state, const std::string
                 
                 int start_piece = (state.file_offset + offset) / state.piece_length;
 
-                // --- FIX: PROTECT THE START OF THE FILE ---
-                // Only execute the zero-availability kill switch if the player is actively SEEKING
-                // deep into the file. The first few pieces must be allowed to wait for peers to connect.
                 if (start_piece > state.first_piece + 5) {
                     std::vector<int> availability;
                     state.h.piece_availability(availability);
@@ -62,7 +63,6 @@ void run_http_server(httplib::Server& svr, StreamState& state, const std::string
                         return false; 
                     }
                 }
-                // ------------------------------------------
 
                 std::int64_t bytes_left = length;
                 std::int64_t current_byte = offset; 
@@ -83,10 +83,17 @@ void run_http_server(httplib::Server& svr, StreamState& state, const std::string
 
                     while (!state.h.have_piece(lt::piece_index_t(current_piece))) {
                         if (state.shutting_down.load() || interrupted.load() || my_id <= state.current_request_id.load() - 6) return false;
-                        if (!sink.is_writable()) return false;
+                        
+                        // Passive Socket Check (Safety net for window closures)
+                        if (!sink.is_writable()) {
+                            write_debug_log(debug, std::format("[STRM] Socket dead (sink not writable). Aborting Session ID: {}", my_id));
+                            return false;
+                        }
 
-                        if (my_id < state.current_request_id.load() && std::abs(current_piece - state.latest_piece_requested.load()) > 10) {
-                            write_debug_log(debug, std::format("[STRM] Aborting Ghost Session ID: {}", my_id));
+                        // --- THE SEEK HOOK ---
+                        // Triggers instantly via the /abort endpoint
+                        if (my_id < state.current_request_id.load()) {
+                            write_debug_log(debug, std::format("[STRM] Active Kill Detected! Instantly aborting obsolete Session ID: {}", my_id));
                             return false; 
                         }
 
