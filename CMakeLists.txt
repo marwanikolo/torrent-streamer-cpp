@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(TorrentStreamer)
 
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- NEW: Fix for CMake 3.30+ FindBoost deprecation warning ---
