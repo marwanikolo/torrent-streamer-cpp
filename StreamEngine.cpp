@@ -222,25 +222,34 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    std::println("\n\n[*] Stopping player and returning to file menu...");
+    std::println("\n\n[*] Shutting down engine...");
     
-    stop_player();
-    h.save_resume_data();
-    
+    // 1. Lock out any new HTTP requests and wake up sleeping threads
     state.shutting_down = true;
     state.cv.notify_all();
     
-    svr.stop();
+    // 2. Stop the player so it stops asking for data
+    stop_player();
     
+    // 3. Gracefully stop the HTTP server
+    svr.stop();
     std::thread([&config]() {
         httplib::Client cli("localhost", config.port);
-        cli.set_connection_timeout(0, 100000); // 100ms
-        cli.Get("/");
+        cli.set_connection_timeout(0, 100000); 
+        cli.Get("/"); // Dummy request to unblock the server listen loop
     }).detach();
 
     if (server_thread.joinable()) server_thread.join();
+
+    // 4. NOW it is 100% safe to pause the swarm and serialize to disk
+    std::println("[*] Saving fastresume data...");
+    h.pause();
+    h.save_resume_data();
+    
+    // Wait for the alert loop to finish saving
     if (alert_thread.joinable()) alert_thread.join();
     
+    // Cleanup piece priorities for the next stream
     for (int p = 0; p < state.num_pieces; ++p) {
         h.piece_priority(lt::piece_index_t(p), lt::dont_download);
     }

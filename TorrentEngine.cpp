@@ -90,7 +90,6 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         
         std::shared_ptr<const lt::torrent_info> ti_new = h.torrent_file();
         
-        // FIX: libtorrent 2.x deprecation fix for create_torrent
         lt::add_torrent_params temp_atp;
         temp_atp.ti = std::make_shared<lt::torrent_info>(*ti_new);
         
@@ -109,8 +108,10 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         std::cout << "                 AVAILABLE FILES\n";
         std::cout << "============================================================\n";
         
-        // FIX: libtorrent 2.x deprecation fix for ti->files()
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         lt::file_storage const& files = ti->files();
+#pragma GCC diagnostic pop
 	
         for (int i = 0; i < files.num_files(); ++i) {
             std::cout << " [" << i << "] " << files.file_path(lt::file_index_t(i)) 
@@ -133,14 +134,18 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         input = input.substr(start, input.find_last_not_of(" \t\r\n") - start + 1);
 
         if (input == "b" || input == "B") {
+            std::cout << "\n[*] Saving fastresume data...\n";
+            h.pause(); // Force disconnect all peers immediately
             h.save_resume_data();
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // Give it time to write
             ses.remove_torrent(h);
             return;
         }
         if (input == "q" || input == "Q") {
+            std::cout << "\n[*] Saving fastresume data...\n";
+            h.pause(); 
             h.save_resume_data();
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             exit(0);
         }
 
