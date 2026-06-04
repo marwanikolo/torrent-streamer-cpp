@@ -4,14 +4,17 @@ build/
 # Logs
 streamer_debug.log
 
-# Torrent and Media files
+# Torrent metadata and cache
 *.torrent
 *.fastresume
+*.parts
+
+# Media extensions (Just in case you drop a file here to test)
 *.mp4
 *.mkv
 *.avi
 *.m2ts
 *.clpi
+*.bdmv
+*.mpls
 *.m3u8
-Over Your Dead Body*
-*.parts

@@ -1,7 +1,7 @@
 #include <iostream>
 #include <fstream>
 #include <csignal>
-#include <sys/stat.h>
+#include <filesystem>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
 #include "Config.h"
@@ -15,6 +15,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
 
     AppConfig config;
+    config.save_dir = "/mnt/LinuxData1/Tordown";
     std::string initial_source = "";
 
     for (int i = 1; i < argc; ++i) {
@@ -26,7 +27,12 @@ int main(int argc, char* argv[]) {
         else initial_source = arg;
     }
 
-    mkdir(config.save_dir.c_str(), 0777);
+    std::error_code ec;
+    std::filesystem::create_directories(config.save_dir, ec);
+    
+    if (ec) {
+        std::cerr << "[-] Warning: Could not create save directory: " << ec.message() << "\n";
+    }
 
     lt::settings_pack pack;
     pack.set_bool(lt::settings_pack::enable_dht, true);
