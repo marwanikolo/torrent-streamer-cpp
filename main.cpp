@@ -3,6 +3,7 @@
 #include <csignal>
 #include <sys/stat.h>
 #include <libtorrent/session.hpp>
+#include <libtorrent/alert_types.hpp>
 #include "Config.h"
 #include "TorrentEngine.h"
 
@@ -38,9 +39,9 @@ int main(int argc, char* argv[]) {
         "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881");
     pack.set_int(lt::settings_pack::connections_limit, 200);
 
-    // Dynamic Alert Masking
-    int alert_mask = lt::alert_category::error | lt::alert_category::status | 
-                     lt::alert_category::storage | lt::alert_category::piece_progress;
+    // FIX: Use the strict type lt::alert_category_t required by libtorrent 2.1
+    lt::alert_category_t alert_mask = lt::alert_category::error | lt::alert_category::status | 
+                                      lt::alert_category::storage | lt::alert_category::piece_progress;
                      
     if (config.debug_mode) {
         alert_mask |= lt::alert_category::torrent_log | lt::alert_category::peer_log;
@@ -50,7 +51,8 @@ int main(int argc, char* argv[]) {
         std::ofstream("streamer_debug.log", std::ios::trunc).close();
     }
     
-    pack.set_int(lt::settings_pack::alert_mask, alert_mask);
+    // FIX: Safely cast the bitfield_flag underlying type back to a standard int
+    pack.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<uint32_t>(alert_mask)));
     lt::session ses(pack);
 
     if (!initial_source.empty()) {

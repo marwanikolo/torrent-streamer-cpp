@@ -31,7 +31,9 @@
 #include <memory>
 #include <atomic>
 #include <ctime>
-#include <algorithm> // Required for std::clamp
+#include <algorithm> 
+
+extern std::atomic<bool> interrupted;
 
 // --- THREAD-SAFE DEBUG LOGGER ---
 std::mutex g_log_mtx;
@@ -56,7 +58,9 @@ struct StreamState {
     int last_piece;  
     std::mutex mtx;
     std::condition_variable cv;
-    bool shutting_down = false;
+    
+    std::atomic<bool> shutting_down{false}; 
+    std::atomic<bool> resume_data_saved{false}; 
     
     std::map<int, int> piece_refs; 
     std::atomic<int> current_request_id{0}; 
@@ -72,7 +76,7 @@ struct WindowManager {
     ~WindowManager() {
         std::lock_guard<std::mutex> lk(state.mtx);
         for (int p : active_window) {
-            if (state.shutting_down) continue;
+            if (state.shutting_down.load()) continue;
             state.piece_refs[p]--;
             if (state.piece_refs[p] <= 0) {
                 state.piece_refs.erase(p);
@@ -115,13 +119,9 @@ struct WindowManager {
 
         for(int p : active_window) {
             if (!state.h.have_piece(lt::piece_index_t(p))) {
-                
-                // Sliding Priority. 
-                // Piece 0 gets priority 7. Piece 1 gets 6. Fades down to a minimum of 1.
                 int prio_val = std::max(1, 7 - (p - start_p));
                 state.h.piece_priority(lt::piece_index_t(p), lt::download_priority_t(static_cast<uint8_t>(prio_val)));
                 
-                // Keep the aggressive deadlines for the immediate playback head
                 if (p <= start_p + 3) {
                     state.h.set_piece_deadline(lt::piece_index_t(p), (p - start_p) * 200);
                 } else {
@@ -147,27 +147,39 @@ std::string get_info_hash_string(const lt::torrent_info& ti) {
 // --- ALERT LOOP ---
 void alert_loop(lt::session& ses, StreamState* state, const std::string& resume_path, bool debug_mode) {
     write_debug_log(debug_mode, "[SYST] Alert Loop Thread Started");
-    while (state && !state->shutting_down) {
+    
+    while (state && !state->shutting_down.load()) {
         ses.wait_for_alert(lt::milliseconds(200));
         std::vector<lt::alert*> alerts;
         ses.pop_alerts(&alerts);
 
         for (lt::alert* a : alerts) {
-            if (debug_mode && 
-                a->type() != lt::piece_finished_alert::alert_type && 
-                a->type() != lt::state_update_alert::alert_type &&
-                a->type() != lt::block_downloading_alert::alert_type &&
-                a->type() != lt::block_finished_alert::alert_type) {
-                 write_debug_log(debug_mode, std::format("[ALRT] {}", a->message()));
-            }
-
             if (lt::alert_cast<lt::piece_finished_alert>(a)) {
                 state->cv.notify_all(); 
             }
-            else if (auto* rd = lt::alert_cast<lt::save_resume_data_alert>(a)) {
+        }
+    }
+
+    auto shutdown_start = std::chrono::steady_clock::now();
+    while (state && !state->resume_data_saved.load()) {
+        if (std::chrono::steady_clock::now() - shutdown_start > std::chrono::seconds(2)) {
+            write_debug_log(debug_mode, "[SYST] Alert Loop: Timeout waiting for resume data. Exiting.");
+            break; 
+        }
+
+        ses.wait_for_alert(lt::milliseconds(200));
+        std::vector<lt::alert*> alerts;
+        ses.pop_alerts(&alerts);
+
+        for (lt::alert* a : alerts) {
+            if (auto* rd = lt::alert_cast<lt::save_resume_data_alert>(a)) {
                 std::vector<char> buffer = lt::write_resume_data_buf(rd->params);
                 std::ofstream of(resume_path, std::ios_base::binary);
                 of.write(buffer.data(), buffer.size());
+                state->resume_data_saved = true; 
+            }
+            else if (lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
+                state->resume_data_saved = true; 
             }
         }
     }
@@ -177,22 +189,24 @@ void alert_loop(lt::session& ses, StreamState* state, const std::string& resume_
 void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h, 
                  std::shared_ptr<const lt::torrent_info> ti, int choice, const std::string& resume_path) {
     
-    extern std::atomic<bool> interrupted; 
     interrupted = false; 
 
     lt::file_storage const& files = ti->files();
     StreamState state;
     state.h = h;
-    state.file_path = config.save_dir + "/" + files.file_path(choice);
-    state.file_size = files.file_size(choice);
-    state.file_offset = files.file_offset(choice);
+    
+    // FIX: Strong-type casts for file_index_t applied here
+    state.file_path = config.save_dir + "/" + files.file_path(lt::file_index_t(choice));
+    state.file_size = files.file_size(lt::file_index_t(choice));
+    state.file_offset = files.file_offset(lt::file_index_t(choice));
+    
     state.piece_length = ti->piece_length();
     state.num_pieces = ti->num_pieces();
     state.first_piece = state.file_offset / state.piece_length;
     state.last_piece = (state.file_offset + state.file_size - 1) / state.piece_length;
 
     std::string hls_playlist = "";
-    std::string selected_path = files.file_path(choice);
+    std::string selected_path = files.file_path(lt::file_index_t(choice));
     bool debug = config.debug_mode;
     
     write_debug_log(debug, std::format("[INIT] Selected File: {} ({} bytes)", selected_path, state.file_size));
@@ -208,16 +222,12 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
     std::string playlist_path = state.file_path + ".m3u8";
 
     if (selected_path.length() >= 5 && selected_path.substr(selected_path.length() - 5) == ".m2ts") {
-        
-        // 1. Check if we already did this math in a previous session
         if (file_exists(playlist_path)) {
             std::cout << "\n[*] Found cached HLS playlist on disk. Skipping index download...\n";
             std::ifstream ifs(playlist_path);
             hls_playlist.assign((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
-            write_debug_log(debug, "[HLS] Loaded existing playlist from: " + playlist_path);
         } 
         else {
-            // 2. Generate a new playlist
             std::string clpi_path = selected_path;
             size_t pos = clpi_path.find("STREAM");
             if (pos != std::string::npos) clpi_path.replace(pos, 6, "CLIPINF");
@@ -226,15 +236,15 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 
             int clpi_idx = -1;
             for (int i = 0; i < files.num_files(); ++i) {
-                if (files.file_path(i) == clpi_path) { clpi_idx = i; break; }
+                if (files.file_path(lt::file_index_t(i)) == clpi_path) { clpi_idx = i; break; }
             }
 
             if (clpi_idx != -1) {
                 priorities[clpi_idx] = lt::top_priority;
                 h.prioritize_files(priorities);
                 
-                int clpi_first_p = files.file_offset(clpi_idx) / state.piece_length;
-                int clpi_last_p = (files.file_offset(clpi_idx) + files.file_size(clpi_idx) - 1) / state.piece_length;
+                int clpi_first_p = files.file_offset(lt::file_index_t(clpi_idx)) / state.piece_length;
+                int clpi_last_p = (files.file_offset(lt::file_index_t(clpi_idx)) + files.file_size(lt::file_index_t(clpi_idx)) - 1) / state.piece_length;
                 
                 std::cout << "\n[*] Downloading Blu-ray index (.clpi) for HLS generation...\n";
                 
@@ -244,21 +254,25 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                 while(true) {
                     h.file_progress(fp);
                     
-                    if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(clpi_idx)) {
+                    if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(lt::file_index_t(clpi_idx))) {
                         std::cout << "\n[*] Index downloaded successfully.\n";
                         break;
                     }
-                    if (interrupted) {
-                        std::cout << "\n[-] Stream aborted by user.\n";
-                        break;
+                    
+                    if (interrupted.load()) {
+                        std::cout << "\n[-] Stream aborted by user. Returning to menu...\n";
+                        for (int p = 0; p < state.num_pieces; ++p) h.piece_priority(lt::piece_index_t(p), lt::dont_download);
+                        h.clear_piece_deadlines();
+                        interrupted = false; 
+                        std::cin.clear();
+                        return; 
                     }
                     
-                    if (fp.size() > clpi_idx && files.file_size(clpi_idx) > 0) {
-                        double clpi_prog = (static_cast<double>(fp[clpi_idx]) / static_cast<double>(files.file_size(clpi_idx))) * 100.0;
+                    if (fp.size() > clpi_idx && files.file_size(lt::file_index_t(clpi_idx)) > 0) {
+                        double clpi_prog = (static_cast<double>(fp[clpi_idx]) / static_cast<double>(files.file_size(lt::file_index_t(clpi_idx)))) * 100.0;
                         std::cout << "\r[>] Index Progress: " << std::fixed << std::setprecision(2) << clpi_prog << "%   " << std::flush;
                     }
                     
-                    // The "Re-Ask" Mechanism: Every 5 seconds, aggressively re-assert deadlines
                     if (++retry_counter % 25 == 0) { 
                         for (int p = clpi_first_p; p <= clpi_last_p; ++p) {
                             h.piece_priority(lt::piece_index_t(p), lt::top_priority);
@@ -269,10 +283,9 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
 
-                // 3. Parse and cache to disk
-                if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(clpi_idx)) {
+                if (fp.size() > clpi_idx && fp[clpi_idx] >= files.file_size(lt::file_index_t(clpi_idx))) {
                     std::cout << "[*] Parsing index and caching HLS playlist to disk...\n";
-                    std::string full_clpi = config.save_dir + "/" + files.file_path(clpi_idx);
+                    std::string full_clpi = config.save_dir + "/" + files.file_path(lt::file_index_t(clpi_idx));
                     auto m_idx = parse_clpi_file(full_clpi);
                     
                     if (!m_idx.empty()) {
@@ -282,10 +295,7 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                         if (ofs.is_open()) {
                             ofs << hls_playlist;
                             ofs.close();
-                            write_debug_log(debug, "[HLS] Successfully saved playlist to: " + playlist_path);
-                        } else {
-                            write_debug_log(debug, "[HLS] ERROR: Failed to write playlist to disk.");
-                        }
+                        } 
                     }
                 }
             }
@@ -298,16 +308,27 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
     std::thread alert_thread(alert_loop, std::ref(ses), &state, resume_path, debug);
 
     while (!file_exists(state.file_path)) {
-        if (interrupted) break;
+        if (interrupted.load()) {
+            std::cout << "\n[-] Stream aborted by user. Returning to menu...\n";
+            state.shutting_down = true;
+            state.cv.notify_all();
+            if (alert_thread.joinable()) alert_thread.join();
+            for (int p = 0; p < state.num_pieces; ++p) h.piece_priority(lt::piece_index_t(p), lt::dont_download);
+            h.clear_piece_deadlines();
+            interrupted = false;
+            std::cin.clear();
+            return; 
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     httplib::Server svr;
     svr.new_task_queue = [] { return new httplib::ThreadPool(64); };
-    svr.set_read_timeout(3600, 0);
-    svr.set_write_timeout(3600, 0);
-    svr.set_keep_alive_max_count(100);
-    svr.set_keep_alive_timeout(3600);
+    
+    svr.set_read_timeout(1, 0);
+    svr.set_write_timeout(1, 0);
+    svr.set_keep_alive_max_count(1);
+    svr.set_keep_alive_timeout(1);
     
     if (debug) {
         svr.set_logger([debug](const httplib::Request& req, const httplib::Response& res) {
@@ -344,35 +365,28 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                 std::ifstream file;
 
                 while (bytes_left > 0) {
-                    if (state.shutting_down || my_id <= state.current_request_id.load() - 6) {
-                        return false;
+                    if (state.shutting_down.load() || interrupted.load() || my_id <= state.current_request_id.load() - 6) {
+                        return false; 
                     }
 
                     int current_piece = (state.file_offset + current_byte) / state.piece_length;
                     
-                    // Target 15 Megabytes of active buffer
                     std::int64_t target_buffer_bytes = 15 * 1024 * 1024; 
-
-                    // Calculate how many pieces are needed to reach 15MB
                     int dynamic_window = static_cast<int>(target_buffer_bytes / state.piece_length);
-
-                    // Clamp it so it never drops below 4 pieces, and never exceeds 12 pieces
                     int window_size = std::clamp(dynamic_window, 4, 12);
                                         
                     wm->update(current_piece, current_piece + window_size); 
 
                     while (!state.h.have_piece(lt::piece_index_t(current_piece))) {
-                        if (state.shutting_down || my_id <= state.current_request_id.load() - 6) return false;
-                        
+                        if (state.shutting_down.load() || interrupted.load() || my_id <= state.current_request_id.load() - 6) return false;
                         if (!sink.is_writable()) return false;
 
                         std::unique_lock<std::mutex> lk(state.mtx);
                         state.cv.wait_for(lk, std::chrono::milliseconds(200));
                     }
 
-                    if (state.shutting_down) return false;
+                    if (state.shutting_down.load() || interrupted.load()) return false;
                     
-                    // FIXED OVERFLOW BUG HERE: Cast `current_piece + 1` to 64-bit int BEFORE multiplication
                     std::int64_t piece_end_byte = std::min(
                         (static_cast<std::int64_t>(current_piece + 1) * state.piece_length) - state.file_offset - 1,
                         state.file_size - 1
@@ -411,6 +425,10 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 
     std::thread server_thread([&]() { svr.listen("localhost", config.port); });
     
+    while (!svr.is_running()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    
     std::string launch_url = hls_playlist.empty() ? 
                              std::format("http://localhost:{}/stream", config.port) : 
                              std::format("http://localhost:{}/playlist.m3u8", config.port);
@@ -419,18 +437,38 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
     launch_player(config, launch_url);
     std::cout << "\n[!] STREAM ACTIVE: Press Ctrl+C to STOP and RETURN TO MENU.\n\n";
 
-    while (!interrupted) {
+    while (!interrupted.load()) {
         lt::torrent_status st = h.status();
         
         std::vector<std::int64_t> fp;
-        h.file_progress(fp); // Removed piece_granularity flag
+        h.file_progress(fp); 
         
         double actual_progress = 0.0;
         if (!fp.empty() && choice < fp.size() && state.file_size > 0) {
             actual_progress = (static_cast<double>(fp[choice]) / static_cast<double>(state.file_size)) * 100.0;
         }
 
-        // Standard forward iterator for pieces
+        // --- NEW: PEER INSPECTION ---
+        std::vector<lt::peer_info> peers;
+        h.get_peer_info(peers);
+
+        int webrtc_count = 0;
+        int standard_count = 0;
+
+        for (const auto& p : peers) {
+            std::string client = p.client;
+            // Convert to lowercase for easy searching
+            std::transform(client.begin(), client.end(), client.begin(), ::tolower);
+            
+            // WebRTC browser peers almost always identify with these strings
+            if (client.find("web") != std::string::npos || client.find("brave") != std::string::npos) {
+                webrtc_count++;
+            } else {
+                standard_count++;
+            }
+        }
+        // ------------------------------
+
         std::string active_pieces = "[";
         int count = 0;
         {
@@ -442,23 +480,33 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
         }
         active_pieces += " ]";
 
-        std::cout << "\r\033[K[>] DL: " << (st.download_rate / 1000) << " kB/s | Progress: " 
-                  << std::fixed << std::setprecision(2) << actual_progress << "% | Peers: " 
-                  << st.num_peers << " | Tracked: " << active_pieces << std::flush;
+        // Upgraded terminal output
+        std::cout << "\r\033[K[>] DL: " << (st.download_rate / 1000) << " kB/s | "
+                  << std::fixed << std::setprecision(2) << actual_progress << "% | "
+                  << "Peers: " << st.num_peers << " (TCP: " << standard_count << " / WebRTC: " << webrtc_count << ") | "
+                  << "Tracked: " << active_pieces << std::flush;
+                  
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     std::cout << "\n\n[*] Stopping player and returning to file menu...\n";
+    
     stop_player();
+    h.save_resume_data();
     
     state.shutting_down = true;
     state.cv.notify_all();
     
-    h.save_resume_data();
-    
     svr.stop();
-    server_thread.join();
-    alert_thread.join();
+    
+    std::thread([&config]() {
+        httplib::Client cli("localhost", config.port);
+        cli.set_connection_timeout(0, 100000); // 100ms
+        cli.Get("/");
+    }).detach();
+
+    if (server_thread.joinable()) server_thread.join();
+    if (alert_thread.joinable()) alert_thread.join();
     
     for (int p = 0; p < state.num_pieces; ++p) {
         h.piece_priority(lt::piece_index_t(p), lt::dont_download);
@@ -470,17 +518,19 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 }
 
 void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
-    extern std::atomic<bool> interrupted;
     interrupted = false;
     std::cin.clear();
 
     lt::settings_pack pack;
     pack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881");
-    pack.set_int(lt::settings_pack::alert_mask, 
+    
+    // FIX: Strong-typed alert mask
+    pack.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<uint32_t>(
         lt::alert_category::error | 
         lt::alert_category::status | 
         lt::alert_category::storage | 
-        lt::alert_category::file_progress);
+        lt::alert_category::file_progress
+    )));
         
     ses.apply_settings(pack);
 
@@ -519,12 +569,24 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         }
     }
 
+    // --- ENABLE NATIVE WEBTORRENT ---
+    std::vector<std::string> wss_trackers = {
+        "wss://tracker.btorrent.xyz",
+        "wss://tracker.openwebtorrent.com",
+        "wss://tracker.webtorrent.dev"
+    };
+
+    for (const auto& wss : wss_trackers) {
+        atp.trackers.push_back(wss);
+    }
+    // --------------------------------
+
     lt::torrent_handle h = ses.add_torrent(atp);
 
     if (!h.status().has_metadata) {
         std::cout << "\n[*] Waiting for Metadata...\n";
         while (!h.status().has_metadata) {
-            if (interrupted) { ses.remove_torrent(h); interrupted = false; return; }
+            if (interrupted.load()) { ses.remove_torrent(h); interrupted = false; return; }
             lt::torrent_status st = h.status();
             std::cout << "\r[>] DHT/LSD Peers: " << st.num_peers << " | Searching...   " << std::flush;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -547,8 +609,9 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         std::cout << "============================================================\n";
         lt::file_storage const& files = ti->files();
         for (int i = 0; i < files.num_files(); ++i) {
-            std::cout << " [" << i << "] " << files.file_path(i) 
-                      << " (" << files.file_size(i) / (1024 * 1024) << " MB)\n";
+            // FIX: Applied file_index_t casts
+            std::cout << " [" << i << "] " << files.file_path(lt::file_index_t(i)) 
+                      << " (" << files.file_size(lt::file_index_t(i)) / (1024 * 1024) << " MB)\n";
         }
 
         std::string input;
@@ -556,7 +619,7 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         
         std::getline(std::cin, input);
 
-        if (interrupted) {
+        if (interrupted.load()) {
             interrupted = false;
             std::cin.clear();
             input = "b"; 

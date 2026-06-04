@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find necessary system libraries
+find_package(LibtorrentRasterbar REQUIRED)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
@@ -19,10 +20,10 @@ set(SOURCES
 # Create the executable
 add_executable(streamer ${SOURCES})
 
-# Link libraries (libtorrent, openssl, pthread)
+# Link libraries (Using the strict LibtorrentRasterbar namespace)
 target_link_libraries(streamer 
     PRIVATE 
-    torrent-rasterbar 
+    LibtorrentRasterbar::torrent-rasterbar 
     OpenSSL::SSL 
     OpenSSL::Crypto 
     Threads::Threads
