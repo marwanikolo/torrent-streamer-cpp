@@ -26,6 +26,10 @@ set(SOURCES
     Utils.cpp 
     ProcessManager.cpp 
     MediaParser.cpp
+    HttpCacheManager.cpp
+    HttpDownloader.cpp
+    HttpProxyServer.cpp
+    DirectLinkEngine.cpp
 )
 
 # Create the executable
@@ -39,3 +43,6 @@ target_link_libraries(streamer
     OpenSSL::Crypto 
     Threads::Threads
 )
+
+# Tell cpp-httplib to enable HTTPS and use OpenSSL
+target_compile_definitions(streamer PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)

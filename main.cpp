@@ -2,10 +2,12 @@
 #include <fstream>
 #include <csignal>
 #include <filesystem>
+#include <print>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
 #include "Config.h"
 #include "TorrentEngine.h"
+#include "DirectLinkEngine.h" // <--- NEW: Direct HTTP Engine Integration
 
 // Define the global interrupt flag
 std::atomic<bool> interrupted{false};
@@ -32,7 +34,7 @@ int main(int argc, char* argv[]) {
     std::filesystem::create_directories(config.save_dir, ec);
     
     if (ec) {
-        std::cerr << "[-] Warning: Could not create save directory: " << ec.message() << "\n";
+        std::println(stderr, "[-] Warning: Could not create save directory: {}", ec.message());
     }
 
     lt::settings_pack pack;
@@ -46,38 +48,44 @@ int main(int argc, char* argv[]) {
         "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881");
     pack.set_int(lt::settings_pack::connections_limit, 200);
 
-    // FIX: Use the strict type lt::alert_category_t required by libtorrent 2.1
     lt::alert_category_t alert_mask = lt::alert_category::error | lt::alert_category::status | 
                                       lt::alert_category::storage | lt::alert_category::piece_progress;
                      
     if (config.debug_mode) {
         alert_mask |= lt::alert_category::torrent_log | lt::alert_category::peer_log;
-        std::cout << "\n[!] DEBUG MODE ENABLED: Writing verbose trace to 'streamer_debug.log'\n";
+        std::println("\n[!] DEBUG MODE ENABLED: Writing verbose trace to 'streamer_debug.log'");
         
         // Wipe the old log file on fresh startup
         std::ofstream("streamer_debug.log", std::ios::trunc).close();
     }
     
-    // FIX: Safely cast the bitfield_flag underlying type back to a standard int
     pack.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<uint32_t>(alert_mask)));
     lt::session ses(pack);
 
+    // Initial source check (Passed via CLI arguments)
     if (!initial_source.empty()) {
-        handle_torrent(ses, config, initial_source);
+        if (initial_source.starts_with("http://") || initial_source.starts_with("https://")) {
+            stream_direct_link(config, initial_source);
+        } else {
+            handle_torrent(ses, config, initial_source);
+        }
     }
 
+    // Main interaction loop
     while (true) {
         interrupted = false;
         std::cin.clear();
         std::string new_source;
-        std::cout << "\n[>] Source (Magnet or .torrent path) [type 'q' to quit]: ";
+        
+        std::print("\n[>] Source (Magnet, .torrent, or HTTP link) [type 'q' to quit]: ");
+        std::fflush(stdout);
         
         std::getline(std::cin, new_source);
 
         if (interrupted) {
             interrupted = false;
             std::cin.clear();
-            std::cout << "\n";
+            std::println("");
             continue;
         }
 
@@ -86,8 +94,14 @@ int main(int argc, char* argv[]) {
         new_source = new_source.substr(start, new_source.find_last_not_of(" \t\r\n") - start + 1);
 
         if (new_source == "q" || new_source == "Q") break;
+        
+        // UNIVERSAL ENGINE ROUTING
         if (!new_source.empty()) {
-            handle_torrent(ses, config, new_source);
+            if (new_source.starts_with("http://") || new_source.starts_with("https://")) {
+                stream_direct_link(config, new_source);
+            } else {
+                handle_torrent(ses, config, new_source);
+            }
         }
     }
 
