@@ -11,9 +11,8 @@
 #include <thread>
 #include <chrono>
 #include <format>
-#include <print>     // <--- NEW C++23 Print Library
+#include <print>     
 #include <algorithm>
-// (Removed <iomanip> as C++23 native formatting handles precision natively)
 
 extern std::atomic<bool> interrupted;
 
@@ -107,7 +106,7 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
                     if (fp.size() > clpi_idx && files.file_size(lt::file_index_t(clpi_idx)) > 0) {
                         double clpi_prog = (static_cast<double>(fp[clpi_idx]) / static_cast<double>(files.file_size(lt::file_index_t(clpi_idx)))) * 100.0;
                         std::print("\r[>] Index Progress: {:.2f}%   ", clpi_prog);
-                        std::fflush(stdout); // Required when printing to terminal without a newline
+                        std::fflush(stdout); 
                     }
                     
                     if (++retry_counter % 25 == 0) { 
@@ -143,21 +142,6 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 
     std::thread alert_thread(alert_loop, std::ref(ses), &state, resume_path, debug);
 
-    while (!file_exists(state.file_path)) {
-        if (interrupted.load()) {
-            std::println("\n[-] Stream aborted by user. Returning to menu...");
-            state.shutting_down = true;
-            state.cv.notify_all();
-            if (alert_thread.joinable()) alert_thread.join();
-            for (int p = 0; p < state.num_pieces; ++p) h.piece_priority(lt::piece_index_t(p), lt::dont_download);
-            h.clear_piece_deadlines();
-            interrupted = false;
-            std::cin.clear();
-            return; 
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
     httplib::Server svr;
     run_http_server(svr, state, hls_playlist, config);
 
@@ -170,6 +154,10 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
     std::string launch_url = hls_playlist.empty() ? 
                              std::format("http://localhost:{}/stream", config.port) : 
                              std::format("http://localhost:{}/playlist.m3u8", config.port);
+                             
+    // FIX: Pass the file extension into the URL string so ProcessManager can "see" it!
+    std::string ext = state.file_path.substr(state.file_path.find_last_of('.') + 1);
+    launch_url += "?ext=." + ext;
                              
     std::println("\n[*] Launching {}...", (hls_playlist.empty() ? "raw stream" : "HLS timeline stream"));
     launch_player(config, launch_url);
@@ -214,7 +202,6 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
         }
         active_pieces += " ]";
 
-        // NEW C++23: std::print handles the complex formatting directly
         std::print("\r\033[K[>] DL: {} kB/s | {:.2f}% | Peers: {} (TCP: {} / WebRTC: {}) | Tracked: {}", 
                    (st.download_rate / 1000), actual_progress, st.num_peers, standard_count, webrtc_count, active_pieces);
         std::fflush(stdout);
@@ -224,32 +211,26 @@ void stream_file(lt::session& ses, AppConfig& config, lt::torrent_handle& h,
 
     std::println("\n\n[*] Shutting down engine...");
     
-    // 1. Lock out any new HTTP requests and wake up sleeping threads
     state.shutting_down = true;
     state.cv.notify_all();
     
-    // 2. Stop the player so it stops asking for data
     stop_player();
     
-    // 3. Gracefully stop the HTTP server
     svr.stop();
     std::thread([&config]() {
         httplib::Client cli("localhost", config.port);
         cli.set_connection_timeout(0, 100000); 
-        cli.Get("/"); // Dummy request to unblock the server listen loop
+        cli.Get("/"); 
     }).detach();
 
     if (server_thread.joinable()) server_thread.join();
 
-    // 4. NOW it is 100% safe to pause the swarm and serialize to disk
     std::println("[*] Saving fastresume data...");
     h.pause();
     h.save_resume_data();
     
-    // Wait for the alert loop to finish saving
     if (alert_thread.joinable()) alert_thread.join();
     
-    // Cleanup piece priorities for the next stream
     for (int p = 0; p < state.num_pieces; ++p) {
         h.piece_priority(lt::piece_index_t(p), lt::dont_download);
     }

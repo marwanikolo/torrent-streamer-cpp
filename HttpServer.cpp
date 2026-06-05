@@ -46,6 +46,7 @@ void run_http_server(httplib::Server& svr, StreamState& state, const std::string
         if (ext == "mkv") mime_type = "video/x-matroska";
         else if (ext == "avi") mime_type = "video/x-msvideo";
         else if (ext == "m2ts" || ext == "ts") mime_type = "video/mp2t";
+        else if (ext == "iso") mime_type = "application/x-iso9660-image"; // <--- NEW: ISO Disk Image Mounting!
 
         res.set_header("Connection", "close");
         res.set_header("Accept-Ranges", "bytes");
