@@ -4,6 +4,7 @@
 #include "HttpProxyServer.h"
 #include "ProcessManager.h"
 #include "Utils.h"
+#include "Config.h" // Ensures AppConfig is correctly defined
 #include <httplib.h>
 #include <print>
 #include <thread>
@@ -13,16 +14,13 @@
 
 extern std::atomic<bool> interrupted;
 
-// A dummy AppConfig struct definition if you don't include it via a global header.
-// Make sure this matches how AppConfig is accessed in StreamEngine.cpp!
-#include "Config.h" 
-
 void stream_direct_link(AppConfig& config, const std::string& url) {
     interrupted = false;
     std::cin.clear();
 
     std::println("\n[*] Initializing Direct HTTP Engine...");
 
+    // Parse URL to isolate host and path for cpp-httplib
     size_t protocol_pos = url.find("://");
     size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
     size_t path_start = url.find('/', host_start);
@@ -50,7 +48,14 @@ void stream_direct_link(AppConfig& config, const std::string& url) {
     }
 
     // 2. Generate a stable, safe filename for the .bin cache file
-    std::string safe_name = url;
+    // STRIP QUERY PARAMS: Ensure expiring tokens don't create new files!
+    std::string base_url = url;
+    size_t query_pos = base_url.find('?');
+    if (query_pos != std::string::npos) {
+        base_url = base_url.substr(0, query_pos);
+    }
+
+    std::string safe_name = base_url;
     std::replace_if(safe_name.begin(), safe_name.end(), [](char c) { return !std::isalnum(c); }, '_');
     if (safe_name.length() > 50) safe_name = safe_name.substr(safe_name.length() - 50);
     std::string cache_path = config.save_dir + "/http_" + safe_name + ".bin";
