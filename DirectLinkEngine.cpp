@@ -33,12 +33,33 @@ void stream_direct_link(AppConfig& config, const std::string& url) {
     // 1. Grab the exact file size via HTTP HEAD request
     httplib::Client cli(host);
     cli.set_follow_location(true);
+    
+    std::int64_t file_size = 0;
     auto res = cli.Head(path.c_str());
 
-    std::int64_t file_size = 0;
-    if (res && (res->status == 200 || res->status == 206)) {
-        if (res->has_header("Content-Length")) {
-            file_size = std::stoll(res->get_header_value("Content-Length"));
+    if (res && (res->status == 200 || res->status == 206) && res->has_header("Content-Length")) {
+        file_size = std::stoll(res->get_header_value("Content-Length"));
+    } 
+    else {
+        std::println("[*] Server blocked HEAD request. Attempting Range GET fallback...");
+        
+        // Fallback: Send a GET request for exactly 1 byte to force a Content-Range response
+        httplib::Headers headers = { {"Range", "bytes=0-0"} };
+        
+        // We use a stream callback so we can instantly abort the download once we get the headers
+        auto get_res = cli.Get(path.c_str(), headers,
+            [&](const char*, size_t) {
+                return false; // Instantly sever the socket, we only want the headers!
+            }
+        );
+
+        if (get_res && get_res->status == 206 && get_res->has_header("Content-Range")) {
+            std::string content_range = get_res->get_header_value("Content-Range");
+            // Format is usually: "bytes 0-0/123456789"
+            size_t slash_pos = content_range.find('/');
+            if (slash_pos != std::string::npos) {
+                file_size = std::stoll(content_range.substr(slash_pos + 1));
+            }
         }
     }
 
@@ -46,6 +67,8 @@ void stream_direct_link(AppConfig& config, const std::string& url) {
         std::println(stderr, "[-] Failed to retrieve Content-Length. Server might not support streaming.");
         return;
     }
+    
+    std::println("[*] File Size Confirmed: {} bytes", file_size);
 
     // 2. Generate a stable, safe filename for the .bin cache file
     // STRIP QUERY PARAMS: Ensure expiring tokens don't create new files!

@@ -18,7 +18,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGCHLD, SIG_IGN);
     
     AppConfig config;
-    config.save_dir = "/mnt/LinuxData1/Tordown";
+    config.save_dir = "/mnt/NewVolume/Tordown";
     std::string initial_source = "";
 
     for (int i = 1; i < argc; ++i) {
