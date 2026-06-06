@@ -1,14 +1,14 @@
 #include "TorrentEngine.h"
-#include "StreamEngine.h"
+#include "ProcessManager.h"
 #include "Utils.h"
+#include <iostream>
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/read_resume_data.hpp>
-#include <libtorrent/settings_pack.hpp>
-#include <iostream>
+#include <print>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -16,28 +16,14 @@
 
 extern std::atomic<bool> interrupted;
 
-void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
+void handle_torrent(TorrentManager& manager, AppConfig& config, std::string source) {
     interrupted = false;
-    std::cin.clear();
-
-    lt::settings_pack pack;
-    pack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881");
-    
-    pack.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<uint32_t>(
-        lt::alert_category::error | 
-        lt::alert_category::status | 
-        lt::alert_category::storage | 
-        lt::alert_category::file_progress
-    )));
-        
-    ses.apply_settings(pack);
-
     lt::add_torrent_params atp;
     std::string hash_str;
 
     if (file_exists(source) && source.find(".torrent") != std::string::npos) {
         atp.ti = std::make_shared<lt::torrent_info>(source);
-        hash_str = get_info_hash_string(*atp.ti);
+        hash_str = get_info_hash_string(*atp.ti); 
     } else {
         atp = lt::parse_magnet_uri(source);
         std::stringstream ss;
@@ -72,27 +58,24 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
         "wss://tracker.openwebtorrent.com",
         "wss://tracker.webtorrent.dev"
     };
-
     for (const auto& wss : wss_trackers) {
         atp.trackers.push_back(wss);
     }
 
-    lt::torrent_handle h = ses.add_torrent(atp);
+    lt::torrent_handle h = manager.ses.add_torrent(atp);
 
     if (!h.status().has_metadata) {
-        std::cout << "\n[*] Waiting for Metadata...\n";
+        std::print("[*] Fetching Metadata for new torrent... ");
+        std::fflush(stdout);
         while (!h.status().has_metadata) {
-            if (interrupted.load()) { ses.remove_torrent(h); interrupted = false; return; }
-            lt::torrent_status st = h.status();
-            std::cout << "\r[>] DHT/LSD Peers: " << st.num_peers << " | Searching...   " << std::flush;
+            if (interrupted.load()) { manager.ses.remove_torrent(h); return; }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
+        std::println("Done!");
         
         std::shared_ptr<const lt::torrent_info> ti_new = h.torrent_file();
-        
         lt::add_torrent_params temp_atp;
         temp_atp.ti = std::make_shared<lt::torrent_info>(*ti_new);
-        
         std::ofstream f(torrent_file_path, std::ios_base::binary);
         std::vector<char> buf;
         lt::bencode(std::back_inserter(buf), lt::write_torrent_file(temp_atp));
@@ -101,62 +84,72 @@ void handle_torrent(lt::session& ses, AppConfig& config, std::string source) {
     
     std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
 
-    while (true) {
-        interrupted = false; 
-        std::cin.clear();
-        std::cout << "\n\n============================================================\n";
-        std::cout << "                 AVAILABLE FILES\n";
-        std::cout << "============================================================\n";
-        
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-        lt::file_storage const& files = ti->files();
+    lt::file_storage const& files = ti->files();
 #pragma GCC diagnostic pop
-	
-        for (int i = 0; i < files.num_files(); ++i) {
-            std::cout << " [" << i << "] " << files.file_path(lt::file_index_t(i)) 
-                      << " (" << files.file_size(lt::file_index_t(i)) / (1024 * 1024) << " MB)\n";
-        }
 
-        std::string input;
-        std::cout << "\n[?] Enter file number, 'b' to go back, 'q' to quit: ";
-        
-        std::getline(std::cin, input);
-
-        if (interrupted.load()) {
-            interrupted = false;
-            std::cin.clear();
-            input = "b"; 
-        }
-
-        auto start = input.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) continue; 
-        input = input.substr(start, input.find_last_not_of(" \t\r\n") - start + 1);
-
-        if (input == "b" || input == "B") {
-            std::cout << "\n[*] Saving fastresume data...\n";
-            h.pause(); // Force disconnect all peers immediately
-            h.save_resume_data();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // Give it time to write
-            ses.remove_torrent(h);
-            return;
-        }
-        if (input == "q" || input == "Q") {
-            std::cout << "\n[*] Saving fastresume data...\n";
-            h.pause(); 
-            h.save_resume_data();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-            exit(0);
-        }
-
-        int choice = -1;
-        try { choice = std::stoi(input); } catch(...) {}
-
-        if (choice < 0 || choice >= files.num_files()) {
-            std::cerr << "[-] Invalid selection. Try again.\n";
-            continue;
-        }
-
-        stream_file(ses, config, h, ti, choice, resume_file_path);
+    std::println("\n============================================================");
+    std::println("                 AVAILABLE FILES");
+    std::println("============================================================");
+    for (int i = 0; i < files.num_files(); ++i) {
+        std::println(" [{}] {} ({} MB)", i, files.file_path(lt::file_index_t(i)), files.file_size(lt::file_index_t(i)) / (1024 * 1024));
     }
+
+    std::string input;
+    std::print("\n[?] Enter file number(s) separated by commas (e.g. 0,2), or 'q' to cancel: ");
+    std::fflush(stdout);
+    std::getline(std::cin, input);
+
+    if (input == "q" || input == "Q") {
+        manager.ses.remove_torrent(h);
+        return;
+    }
+
+    std::vector<int> selected_indices;
+    std::stringstream ss_input(input);
+    std::string token;
+    while (std::getline(ss_input, token, ',')) {
+        try {
+            int idx = std::stoi(token);
+            if (idx >= 0 && idx < files.num_files()) selected_indices.push_back(idx);
+        } catch(...) {}
+    }
+
+    if (selected_indices.empty()) {
+        std::println("[-] No valid files selected. Canceling torrent.");
+        manager.ses.remove_torrent(h);
+        return;
+    }
+
+    for (int i = 0; i < files.num_files(); ++i) h.file_priority(lt::file_index_t(i), lt::download_priority_t{0});
+
+    std::println("\n[+] Torrent Registered Successfully!");
+    std::println("  Name: {}", ti->name());
+
+    for (int idx : selected_indices) {
+        h.file_priority(lt::file_index_t(idx), lt::download_priority_t{4});
+
+        auto state = std::make_shared<StreamState>();
+        state->h = h;
+        state->file_path = config.save_dir + "/" + files.file_path(lt::file_index_t(idx));
+        state->file_size = files.file_size(lt::file_index_t(idx));
+        state->file_offset = files.file_offset(lt::file_index_t(idx));
+        state->piece_length = ti->piece_length();
+        state->num_pieces = ti->num_pieces();
+        state->first_piece = state->file_offset / state->piece_length;
+        state->last_piece = (state->file_offset + state->file_size - 1) / state->piece_length;
+
+        std::string stream_id = hash_str + "_" + std::to_string(idx);
+        manager.add_stream(stream_id, state);
+
+        std::string stream_url = "http://localhost:" + std::to_string(config.port) + "/stream/" + stream_id;
+        std::string abort_url = "http://localhost:" + std::to_string(config.port) + "/abort/" + stream_id;
+
+        std::println("  => [{}] {} ({} MB)", idx, files.file_path(lt::file_index_t(idx)), files.file_size(lt::file_index_t(idx)) / (1024 * 1024));
+        std::println("     URL: {}", stream_url);
+
+        launch_player(config, stream_url, abort_url);
+    }
+    std::println("");
 }

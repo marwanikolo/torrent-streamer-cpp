@@ -19,7 +19,6 @@ find_package(OpenSSL REQUIRED)
 set(SOURCES
     main.cpp 
     TorrentEngine.cpp 
-    StreamEngine.cpp 
     WindowManager.cpp
     AlertHandler.cpp
     HttpServer.cpp

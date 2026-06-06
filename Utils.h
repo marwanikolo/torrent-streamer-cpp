@@ -24,11 +24,9 @@ inline void write_debug_log(bool debug, const std::string& msg) {
     std::tm tm_buf;
     localtime_r(&now, &tm_buf); 
 
-    // C++23: std::println natively formats directly to the terminal stdout!
-    std::println("[{:02}:{:02}:{:02}] {}", tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
+    // REMOVED std::println so background threads stop polluting the daemon prompt!
     
-    // Fun Fact: std::println for file ostreams is officially arriving in C++26.
-    // For strictly C++23, we use std::format to write to the file stream.
+    // Write exclusively to the log file
     log_file << std::format("[{:02}:{:02}:{:02}] {}\n", tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, msg);
 }
 
@@ -39,7 +37,6 @@ inline void write_debug_log(bool debug, const std::string& msg) {
 template <typename... Args>
 inline void write_debug_log(bool debug, std::format_string<Args...> fmt, Args&&... args) {
     if (!debug) return;
-    // Format the string safely at compile-time, then pass to the core logger
     write_debug_log(debug, std::format(fmt, std::forward<Args>(args)...));
 }
 

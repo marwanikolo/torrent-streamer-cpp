@@ -1,6 +1,5 @@
 #pragma once
-#include "StreamState.h"
-#include <libtorrent/session.hpp>
+#include "TorrentEngine.h"
 #include <string>
 
-void alert_loop(lt::session& ses, StreamState* state, const std::string& resume_path, bool debug_mode);
+void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool debug_mode);

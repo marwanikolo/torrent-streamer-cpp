@@ -3,13 +3,17 @@
 #include <csignal>
 #include <filesystem>
 #include <print>
+#include <thread>
+#include <httplib.h>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
+
 #include "Config.h"
 #include "TorrentEngine.h"
-#include "DirectLinkEngine.h" // <--- NEW: Direct HTTP Engine Integration
+#include "AlertHandler.h"
+#include "HttpServer.h"
+#include "DirectLinkEngine.h"
 
-// Define the global interrupt flag
 std::atomic<bool> interrupted{false};
 void signal_handler(int) { interrupted = true; }
 
@@ -19,6 +23,8 @@ int main(int argc, char* argv[]) {
     
     AppConfig config;
     config.save_dir = "/mnt/NewVolume/Tordown";
+    if (config.port <= 0) config.port = 8080; 
+    
     std::string initial_source = "";
 
     for (int i = 1; i < argc; ++i) {
@@ -32,10 +38,7 @@ int main(int argc, char* argv[]) {
 
     std::error_code ec;
     std::filesystem::create_directories(config.save_dir, ec);
-    
-    if (ec) {
-        std::println(stderr, "[-] Warning: Could not create save directory: {}", ec.message());
-    }
+    if (ec) std::println(stderr, "[-] Warning: Could not create save directory: {}", ec.message());
 
     lt::settings_pack pack;
     pack.set_bool(lt::settings_pack::enable_dht, true);
@@ -54,56 +57,123 @@ int main(int argc, char* argv[]) {
     if (config.debug_mode) {
         alert_mask |= lt::alert_category::torrent_log | lt::alert_category::peer_log;
         std::println("\n[!] DEBUG MODE ENABLED: Writing verbose trace to 'streamer_debug.log'");
-        
-        // Wipe the old log file on fresh startup
         std::ofstream("streamer_debug.log", std::ios::trunc).close();
     }
-    
     pack.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<uint32_t>(alert_mask)));
-    lt::session ses(pack);
 
-    // Initial source check (Passed via CLI arguments)
+    TorrentManager manager;
+    manager.ses.apply_settings(pack);
+
+    std::thread alert_thread(alert_loop, std::ref(manager), config.save_dir, config.debug_mode);
+
+    httplib::Server svr;
+    std::thread server_thread([&]() {
+        run_http_server(svr, manager, "", config);
+        svr.listen("0.0.0.0", config.port);
+    });
+
+    std::println("\n[SYST] Daemon running successfully.");
+    std::println("[SYST] Local HTTP Server listening on port {}", config.port);
+    std::println("\nCommands:");
+    std::println("  add <link>   - Add a new magnet, .torrent, or HTTP link");
+    std::println("  list         - Show active torrent streams");
+    std::println("  quit         - Shut down the daemon gracefully\n");
+
+    // Handle initial source passed via CLI arguments with quote-stripping safety
     if (!initial_source.empty()) {
-        if (initial_source.starts_with("http://") || initial_source.starts_with("https://")) {
-            stream_direct_link(config, initial_source);
+        auto ns_start = initial_source.find_first_not_of(" \t\r\n\"'");
+        if (ns_start != std::string::npos) {
+            initial_source = initial_source.substr(ns_start, initial_source.find_last_not_of(" \t\r\n\"'") - ns_start + 1);
         } else {
-            handle_torrent(ses, config, initial_source);
+            initial_source = "";
+        }
+
+        if (!initial_source.empty()) {
+            if (initial_source.starts_with("http://") || initial_source.starts_with("https://")) {
+                std::thread([config, initial_source]() {
+                    AppConfig cfg = config;
+                    stream_direct_link(cfg, initial_source);
+                }).detach();
+            } else {
+                try {
+                    handle_torrent(manager, config, initial_source);
+                } catch (const std::exception& e) {
+                    std::println(stderr, "[-] Failed to parse torrent/magnet: {}", e.what());
+                }
+            }
         }
     }
 
-    // Main interaction loop
     while (true) {
         interrupted = false;
         std::cin.clear();
-        std::string new_source;
+        std::string line;
         
-        std::print("\n[>] Source (Magnet, .torrent, or HTTP link) [type 'q' to quit]: ");
+        std::print("daemon> ");
         std::fflush(stdout);
         
-        std::getline(std::cin, new_source);
+        if (!std::getline(std::cin, line)) break;
 
         if (interrupted) {
             interrupted = false;
-            std::cin.clear();
             std::println("");
             continue;
         }
 
-        auto start = new_source.find_first_not_of(" \t\r\n");
+        auto start = line.find_first_not_of(" \t\r\n");
         if (start == std::string::npos) continue;
-        new_source = new_source.substr(start, new_source.find_last_not_of(" \t\r\n") - start + 1);
+        line = line.substr(start, line.find_last_not_of(" \t\r\n") - start + 1);
 
-        if (new_source == "q" || new_source == "Q") break;
-        
-        // UNIVERSAL ENGINE ROUTING
-        if (!new_source.empty()) {
-            if (new_source.starts_with("http://") || new_source.starts_with("https://")) {
-                stream_direct_link(config, new_source);
-            } else {
-                handle_torrent(ses, config, new_source);
+        if (line == "quit" || line == "q") {
+            break;
+        } 
+        else if (line == "list") {
+            std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
+            std::println("Active Streams: {}", manager.active_streams.size());
+            for (const auto& [hash, state] : manager.active_streams) {
+                std::println("  => [{}] {}", hash.substr(0, 8), state->file_path);
+                std::println("     URL: http://localhost:{}/stream/{}", config.port, hash);
             }
+        } 
+        else if (line.starts_with("add ")) {
+            std::string new_source = line.substr(4);
+            
+            // 1. Strip spaces AND quotes (' or ") from the start and end of the pasted link
+            auto ns_start = new_source.find_first_not_of(" \t\r\n\"'");
+            if (ns_start != std::string::npos) {
+                new_source = new_source.substr(ns_start, new_source.find_last_not_of(" \t\r\n\"'") - ns_start + 1);
+            } else {
+                new_source = "";
+            }
+
+            if (new_source.empty()) continue;
+
+            if (new_source.starts_with("http://") || new_source.starts_with("https://")) {
+                std::thread([config, new_source]() {
+                    AppConfig cfg = config;
+                    stream_direct_link(cfg, new_source);
+                }).detach();
+            } else {
+                // 2. Safety Net: Catch libtorrent crashes so the daemon stays alive!
+                try {
+                    handle_torrent(manager, config, new_source);
+                } catch (const std::exception& e) {
+                    std::println(stderr, "[-] Failed to parse torrent/magnet: {}", e.what());
+                    std::println(stderr, "[-] Returning to daemon prompt.");
+                }
+            }
+        } 
+        else {
+            std::println("Unknown command. Use 'add <link>', 'list', or 'quit'.");
         }
     }
+
+    std::println("\n[SYST] Shutting down daemon... waiting for threads to exit.");
+    interrupted = true;
+    svr.stop();
+    
+    if (server_thread.joinable()) server_thread.join();
+    if (alert_thread.joinable()) alert_thread.join();
 
     return 0;
 }
