@@ -29,6 +29,7 @@ set(SOURCES
     HttpDownloader.cpp
     HttpProxyServer.cpp
     DirectLinkEngine.cpp
+    YtdlpWrapper.cpp
 )
 
 # Create the executable

@@ -6,8 +6,8 @@
 #include <format>
 #include <algorithm>
 
-HttpDownloader::HttpDownloader(HttpCacheManager& cache, const std::string& url) 
-    : cache_(cache), url_(url) {
+HttpDownloader::HttpDownloader(HttpCacheManager& cache, const std::string& url, const httplib::Headers& headers) 
+    : cache_(cache), url_(url), extra_headers_(headers) {
     
     size_t protocol_pos = url_.find("://");
     size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
@@ -85,20 +85,19 @@ bool HttpDownloader::download_chunk(size_t chunk_index) {
     cli.set_follow_location(true);
 
     std::int64_t start_byte = chunk_index * cache_.get_chunk_size();
-    
     std::int64_t end_byte = std::min<std::int64_t>(
         start_byte + cache_.get_chunk_size() - 1, 
         cache_.get_file_size() - 1
     );
 
-    httplib::Headers headers = {
-        {"Range", std::format("bytes={}-{}", start_byte, end_byte)}
-    };
+    // Merge the requested Range with the yt-dlp headers
+    httplib::Headers req_headers = extra_headers_;
+    req_headers.emplace("Range", std::format("bytes={}-{}", start_byte, end_byte));
 
     std::int64_t current_offset = start_byte;
     bool download_aborted = false;
 
-    auto res = cli.Get(path_.c_str(), headers,
+    auto res = cli.Get(path_.c_str(), req_headers,
         [&](const char *data, size_t data_length) {
             if (!active_.load()) {
                 download_aborted = true;

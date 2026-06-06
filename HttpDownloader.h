@@ -4,10 +4,11 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <httplib.h>
 
 class HttpDownloader {
 public:
-    HttpDownloader(HttpCacheManager& cache, const std::string& url);
+    HttpDownloader(HttpCacheManager& cache, const std::string& url, const httplib::Headers& headers);
     ~HttpDownloader();
 
     void start();
@@ -26,6 +27,9 @@ private:
     std::string url_;
     std::string host_;
     std::string path_;
+    
+    // HTTP Headers for yt-dlp CDN support
+    httplib::Headers extra_headers_;
 
     // Threading state
     std::thread worker_thread_;

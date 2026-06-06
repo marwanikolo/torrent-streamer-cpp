@@ -4,8 +4,8 @@
 #include <format>
 #include <algorithm>
 
-HttpProxyServer::HttpProxyServer(HttpCacheManager& cache, HttpDownloader& downloader, const std::string& video_url, int port, const std::string& stream_id, bool debug)
-    : cache_(cache), downloader_(downloader), video_url_(video_url), port_(port), stream_id_(stream_id), debug_(debug) {
+HttpProxyServer::HttpProxyServer(HttpCacheManager& cache, HttpDownloader& downloader, const std::string& video_url, int port, const std::string& stream_id, bool debug, const httplib::Headers& headers)
+    : cache_(cache), downloader_(downloader), video_url_(video_url), port_(port), stream_id_(stream_id), debug_(debug), extra_headers_(headers) {
     
     size_t protocol_pos = video_url_.find("://");
     size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
@@ -103,10 +103,13 @@ void HttpProxyServer::setup_routes() {
                     }
 
                     std::int64_t req_end = std::min<std::int64_t>(current_byte + bytes_left - 1, chunk_end);
-                    httplib::Headers headers = { {"Range", std::format("bytes={}-{}", current_byte, req_end)} };
+                    
+                    // Merge requested range with the yt-dlp headers
+                    httplib::Headers req_headers = extra_headers_;
+                    req_headers.emplace("Range", std::format("bytes={}-{}", current_byte, req_end));
                     
                     bool abort_proxy = false;
-                    auto web_res = cli.Get(path_.c_str(), headers, [&](const char *data, size_t data_length) {
+                    auto web_res = cli.Get(path_.c_str(), req_headers, [&](const char *data, size_t data_length) {
                         if (is_shutting_down_ || my_id < current_request_id_) {
                             abort_proxy = true;
                             return false; 

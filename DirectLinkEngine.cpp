@@ -15,10 +15,9 @@
 
 extern std::atomic<bool> interrupted;
 
-// Provide dynamic ports for direct links so they don't collide with Torrents!
 static std::atomic<int> next_proxy_port{0};
 
-void stream_direct_link(AppConfig& config, const std::string& url) {
+void stream_direct_link(AppConfig& config, const std::string& url, const httplib::Headers& headers) {
     interrupted = false;
     std::println("\n[*] Initializing Direct HTTP Engine...");
 
@@ -36,14 +35,20 @@ void stream_direct_link(AppConfig& config, const std::string& url) {
     httplib::Client cli(host);
     cli.set_follow_location(true);
     std::int64_t file_size = 0;
-    auto res = cli.Head(path.c_str());
+    
+    // 1. Pass the yt-dlp headers to the initial HEAD request!
+    auto res = cli.Head(path.c_str(), headers);
 
     if (res && (res->status == 200 || res->status == 206) && res->has_header("Content-Length")) {
         file_size = std::stoll(res->get_header_value("Content-Length"));
     } else {
         std::println("[*] Server blocked HEAD request. Attempting Range GET fallback...");
-        httplib::Headers headers = { {"Range", "bytes=0-0"} };
-        auto get_res = cli.Get(path.c_str(), headers, [&](const char*, size_t) { return false; });
+        
+        // 2. Merge our Range fallback with the yt-dlp headers
+        httplib::Headers req_headers = headers; 
+        req_headers.emplace("Range", "bytes=0-0");
+        
+        auto get_res = cli.Get(path.c_str(), req_headers, [&](const char*, size_t) { return false; });
         if (get_res && get_res->status == 206 && get_res->has_header("Content-Range")) {
             std::string content_range = get_res->get_header_value("Content-Range");
             size_t slash_pos = content_range.find('/');
@@ -73,13 +78,13 @@ void stream_direct_link(AppConfig& config, const std::string& url) {
     auto cache = std::make_shared<HttpCacheManager>(cache_path, file_size);
     cache->init();
 
-    auto downloader = std::make_shared<HttpDownloader>(*cache, url);
+    // 3. Pass headers into the backend engines
+    auto downloader = std::make_shared<HttpDownloader>(*cache, url, headers);
     downloader->start();
 
-    // Assign a unique port to this proxy!
     int my_proxy_port = next_proxy_port++;
 
-    auto proxy = std::make_shared<HttpProxyServer>(*cache, *downloader, url, my_proxy_port, stream_id, config.debug_mode);
+    auto proxy = std::make_shared<HttpProxyServer>(*cache, *downloader, url, my_proxy_port, stream_id, config.debug_mode, headers);
     proxy->start();
 
     std::string stream_url = std::format("http://localhost:{}/stream/{}", my_proxy_port, stream_id);

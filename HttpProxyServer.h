@@ -8,7 +8,7 @@
 
 class HttpProxyServer {
 public:
-    HttpProxyServer(HttpCacheManager& cache, HttpDownloader& downloader, const std::string& video_url, int port, const std::string& stream_id, bool debug);
+    HttpProxyServer(HttpCacheManager& cache, HttpDownloader& downloader, const std::string& video_url, int port, const std::string& stream_id, bool debug, const httplib::Headers& headers);
     ~HttpProxyServer();
     void start();
     void stop();
@@ -25,6 +25,9 @@ private:
     
     std::string host_;
     std::string path_;
+    
+    // HTTP Headers for yt-dlp CDN support
+    httplib::Headers extra_headers_;
     
     httplib::Server svr_;
     std::thread server_thread_;
