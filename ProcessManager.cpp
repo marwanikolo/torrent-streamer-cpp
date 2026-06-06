@@ -14,7 +14,7 @@
 std::vector<pid_t> active_players;
 std::mutex player_mtx;
 
-void launch_player(const AppConfig& config, const std::string& stream_url, const std::string& abort_url) {
+void launch_player(const AppConfig& config, const std::string& stream_url, const std::string& abort_url, const std::string& audio_url) {
     bool is_iso = (stream_url.find(".iso") != std::string::npos || 
                    stream_url.find(".ISO") != std::string::npos);
     
@@ -88,6 +88,13 @@ void launch_player(const AppConfig& config, const std::string& stream_url, const
             std::string script_arg = "--script=" + mpv_script_path;
             if (!abort_url.empty()) args.push_back(script_arg.c_str());
             
+            // --- NEW: Audio Injection ---
+            std::string audio_arg = "";
+            if (!audio_url.empty()) {
+                audio_arg = "--audio-file=" + audio_url;
+                args.push_back(audio_arg.c_str());
+            }
+            
             args.push_back(stream_url.c_str());
             args.push_back(nullptr);
             execvp(args[0], const_cast<char* const*>(args.data()));
@@ -106,6 +113,14 @@ void launch_player(const AppConfig& config, const std::string& stream_url, const
                 args.push_back(lua_intf_arg.c_str());
             }
             if (is_iso) args.push_back("--no-bluray-menu");
+            
+            // Note: VLC handling of external audio over HTTP is less elegant than MPV,
+            // but we can append it via input-slave if necessary. MPV handles this natively.
+            std::string vlc_audio_arg = "";
+            if (!audio_url.empty()) {
+                vlc_audio_arg = "--input-slave=" + audio_url;
+                args.push_back(vlc_audio_arg.c_str());
+            }
             
             args.push_back(stream_url.c_str());
             args.push_back(nullptr);

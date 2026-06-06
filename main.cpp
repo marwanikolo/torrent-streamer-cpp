@@ -183,7 +183,7 @@ int main(int argc, char* argv[]) {
                                 i, f.format_id, f.ext, f.resolution, f.vcodec, f.acodec, f.filesize_mb);
                         }
 
-                        std::print("\n[?] Enter format number to stream, or 'q' to cancel: ");
+                        std::print("\n[?] Enter format number to stream (e.g., 25 or 25+6), or 'q' to cancel: ");
                         std::fflush(stdout);
                         std::string choice;
                         std::getline(std::cin, choice);
@@ -191,12 +191,29 @@ int main(int argc, char* argv[]) {
                         if (choice == "q" || choice == "Q") continue;
 
                         try {
-                            int idx = std::stoi(choice);
-                            if (idx >= 0 && idx < formats.size()) {
-                                std::println("\n[+] Selected Format [{}] - Proxying stream...", formats[idx].format_id);
+                            int v_idx = -1;
+                            int a_idx = -1;
+                            
+                            // Check if user specified Video+Audio (e.g. 160+140)
+                            size_t plus_pos = choice.find('+');
+                            if (plus_pos != std::string::npos) {
+                                v_idx = std::stoi(choice.substr(0, plus_pos));
+                                a_idx = std::stoi(choice.substr(plus_pos + 1));
+                            } else {
+                                v_idx = std::stoi(choice);
+                            }
+
+                            if (v_idx >= 0 && v_idx < formats.size()) {
+                                std::string a_url = "";
+                                if (a_idx >= 0 && a_idx < formats.size()) {
+                                    std::println("\n[+] Selected Video [{}] + Audio [{}] - Proxying streams...", formats[v_idx].format_id, formats[a_idx].format_id);
+                                    a_url = formats[a_idx].url;
+                                } else {
+                                    std::println("\n[+] Selected Format [{}] - Proxying stream...", formats[v_idx].format_id);
+                                }
+                                
                                 AppConfig cfg = config;
-                                // Pass the extracted URL and CDN Headers directly to your Proxy Engine
-                                stream_direct_link(cfg, formats[idx].url, formats[idx].headers);
+                                stream_direct_link(cfg, formats[v_idx].url, formats[v_idx].headers, a_url);
                             } else {
                                 std::println("[-] Invalid selection.");
                             }
