@@ -1,4 +1,5 @@
 #include "HttpCacheManager.h"
+#include "Utils.h"
 #include <print>
 #include <iostream>
 
@@ -30,30 +31,26 @@ void HttpCacheManager::init() {
         load_state();
     }
 
-    // Open the file for both reading and writing in binary mode without truncating
     file_stream_.open(file_path_, std::ios::in | std::ios::out | std::ios::binary);
     if (!file_stream_.is_open()) {
-        std::println(stderr, "[!] FATAL: Could not open cache file: {}", file_path_);
+        write_debug_log(true, "[!] FATAL: Could not open cache file: {}", file_path_);
     }
 }
 
 void HttpCacheManager::allocate_sparse_file() {
-    std::println("[*] Allocating sparse cache file: {} ({} bytes)", file_path_, file_size_);
+    write_debug_log(true, "[*] Allocating sparse cache file: {} ({} bytes)", file_path_, file_size_);
     
-    // Create an empty file first
     {
         std::ofstream ofs(file_path_, std::ios::binary | std::ios::trunc);
     }
     
-    // C++17 native sparse allocation (Instantaneous on ext4/NTFS/APFS)
     std::error_code ec;
     fs::resize_file(file_path_, file_size_, ec);
     
     if (ec) {
-        std::println(stderr, "[!] Sparse allocation failed: {}", ec.message());
+        write_debug_log(true, "[!] Sparse allocation failed: {}", ec.message());
     }
 
-    // FIX: Scope the lock so it releases BEFORE we call save_state()
     {
         std::lock_guard<std::mutex> lock(state_mtx_);
         std::fill(downloaded_chunks_.begin(), downloaded_chunks_.end(), 0);
@@ -69,15 +66,13 @@ void HttpCacheManager::load_state() {
     std::ifstream ifs(state_path_, std::ios::binary);
     if (ifs.is_open()) {
         ifs.read(reinterpret_cast<char*>(downloaded_chunks_.data()), downloaded_chunks_.size());
-        std::println("[*] Loaded existing HTTP cache state. Resuming...");
+        write_debug_log(true, "[*] Loaded existing HTTP cache state. Resuming...");
     }
 }
 
 void HttpCacheManager::save_state() {
     std::lock_guard<std::mutex> lock(state_mtx_);
     
-    // Write to a .tmp file first, then rename. This guarantees atomic 
-    // saves and prevents corruption if the user hits Ctrl+C mid-write.
     std::string temp_state = state_path_ + ".tmp";
     std::ofstream ofs(temp_state, std::ios::binary | std::ios::trunc);
     

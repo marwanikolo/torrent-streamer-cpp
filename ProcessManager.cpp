@@ -8,17 +8,31 @@
 #include <fstream> 
 #include <string>  
 #include <vector>
+#include <mutex>
+#include <chrono>
 
-pid_t player_pid = -1;
+std::vector<pid_t> active_players;
+std::mutex player_mtx;
 
 void launch_player(const AppConfig& config, const std::string& stream_url, const std::string& abort_url) {
     bool is_iso = (stream_url.find(".iso") != std::string::npos || 
                    stream_url.find(".ISO") != std::string::npos);
     
     std::string player_exec = is_iso ? "vlc" : config.player_path;
-    std::string mpv_script_path = config.save_dir + "/seek_hook.lua";
+    
+    // Create a perfectly unique ID for the Lua script
+    std::string safe_id = "default";
+    if (!abort_url.empty()) {
+        size_t last_slash = abort_url.find_last_of('/');
+        if (last_slash != std::string::npos) safe_id = abort_url.substr(last_slash + 1);
+    } else {
+        safe_id = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+    }
+
+    std::string mpv_script_path = config.save_dir + "/seek_hook_" + safe_id + ".lua";
     std::string vlc_dir = std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/.local/share/vlc/lua/intf";
-    std::string vlc_script_path = vlc_dir + "/tordown.lua";
+    std::string vlc_script_name = "tordown_" + safe_id;
+    std::string vlc_script_path = vlc_dir + "/" + vlc_script_name + ".lua";
 
     if (!abort_url.empty()) {
         std::ofstream mpv_lua(mpv_script_path);
@@ -48,8 +62,8 @@ void launch_player(const AppConfig& config, const std::string& stream_url, const
         }
     }
 
-    player_pid = fork();
-    if (player_pid == 0) {
+    pid_t pid = fork();
+    if (pid == 0) {
         setpgid(0, 0);
 
         long max_fd = sysconf(_SC_OPEN_MAX);
@@ -86,9 +100,10 @@ void launch_player(const AppConfig& config, const std::string& stream_url, const
                 "--file-caching=2000"
             };
             
+            std::string lua_intf_arg = "--lua-intf=" + vlc_script_name;
             if (!abort_url.empty()) {
                 args.push_back("--extraintf=luaintf");
-                args.push_back("--lua-intf=tordown");
+                args.push_back(lua_intf_arg.c_str());
             }
             if (is_iso) args.push_back("--no-bluray-menu");
             
@@ -100,20 +115,16 @@ void launch_player(const AppConfig& config, const std::string& stream_url, const
             execlp(player_exec.c_str(), player_exec.c_str(), stream_url.c_str(), nullptr);
         }
         exit(1);
+    } else if (pid > 0) {
+        std::lock_guard<std::mutex> lk(player_mtx);
+        active_players.push_back(pid);
     }
 }
 
 void stop_player() {
-    if (player_pid > 0) {
-        kill(player_pid, SIGTERM);
-        int status;
-        if (waitpid(player_pid, &status, WNOHANG) == 0) {
-            usleep(1000000); 
-            if (waitpid(player_pid, &status, WNOHANG) == 0) {
-                kill(player_pid, SIGKILL);
-                waitpid(player_pid, &status, 0); 
-            }
-        }
-        player_pid = -1;
+    std::lock_guard<std::mutex> lk(player_mtx);
+    for (pid_t pid : active_players) {
+        kill(pid, SIGKILL); 
     }
+    active_players.clear();
 }

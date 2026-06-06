@@ -1,4 +1,5 @@
 #include "HttpDownloader.h"
+#include "Utils.h"
 #include <httplib.h>
 #include <print>
 #include <chrono>
@@ -8,7 +9,6 @@
 HttpDownloader::HttpDownloader(HttpCacheManager& cache, const std::string& url) 
     : cache_(cache), url_(url) {
     
-    // Tiny URL parser for cpp-httplib (Requires separating host and path)
     size_t protocol_pos = url_.find("://");
     size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
     size_t path_start = url_.find('/', host_start);
@@ -30,7 +30,7 @@ void HttpDownloader::start() {
     if (active_.load()) return;
     active_ = true;
     worker_thread_ = std::thread(&HttpDownloader::worker_loop, this);
-    std::println("[*] Background Downloader initialized.");
+    write_debug_log(true, "[*] Background Downloader initialized.");
 }
 
 void HttpDownloader::stop() {
@@ -51,7 +51,6 @@ void HttpDownloader::worker_loop() {
         size_t target = std::string::npos;
         size_t current_playhead = playhead_.load();
 
-        // 1. Scan forward from the user's current playback position
         for (size_t i = current_playhead; i < total; ++i) {
             if (!cache_.has_chunk(i)) {
                 target = i;
@@ -59,7 +58,6 @@ void HttpDownloader::worker_loop() {
             }
         }
 
-        // 2. If nothing ahead, wrap around and scan the beginning
         if (target == std::string::npos) {
             for (size_t i = 0; i < current_playhead; ++i) {
                 if (!cache_.has_chunk(i)) {
@@ -69,15 +67,12 @@ void HttpDownloader::worker_loop() {
             }
         }
 
-        // 3. If still nothing, the file is 100% downloaded!
         if (target == std::string::npos) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
 
-        // 4. Download the missing chunk
         if (!download_chunk(target)) {
-            // If download fails or network drops, sleep briefly to prevent CPU spam
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
     }
@@ -87,11 +82,10 @@ bool HttpDownloader::download_chunk(size_t chunk_index) {
     httplib::Client cli(host_);
     cli.set_connection_timeout(5);
     cli.set_read_timeout(5);
-    cli.set_follow_location(true); // Crucial for modern CDNs
+    cli.set_follow_location(true);
 
     std::int64_t start_byte = chunk_index * cache_.get_chunk_size();
     
-    // Prevent requesting bytes beyond the actual file length
     std::int64_t end_byte = std::min<std::int64_t>(
         start_byte + cache_.get_chunk_size() - 1, 
         cache_.get_file_size() - 1
@@ -108,7 +102,7 @@ bool HttpDownloader::download_chunk(size_t chunk_index) {
         [&](const char *data, size_t data_length) {
             if (!active_.load()) {
                 download_aborted = true;
-                return false; // Returning false instantly severs the TCP socket
+                return false; 
             }
             cache_.write_data(current_offset, data, data_length);
             current_offset += data_length;
@@ -118,7 +112,7 @@ bool HttpDownloader::download_chunk(size_t chunk_index) {
 
     if (res && (res->status == 206 || res->status == 200) && !download_aborted) {
         cache_.set_chunk(chunk_index);
-        std::println("[BACK] Chunk {} perfectly cached.", chunk_index);
+        write_debug_log(true, "[BACK] Chunk {} perfectly cached.", chunk_index);
         return true;
     }
 

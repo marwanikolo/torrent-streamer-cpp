@@ -11,12 +11,20 @@
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <atomic>
 
 extern std::atomic<bool> interrupted;
+
+// Provide dynamic ports for direct links so they don't collide with Torrents!
+static std::atomic<int> next_proxy_port{0};
 
 void stream_direct_link(AppConfig& config, const std::string& url) {
     interrupted = false;
     std::println("\n[*] Initializing Direct HTTP Engine...");
+
+    if (next_proxy_port.load() == 0) {
+        next_proxy_port.store(config.port + 1);
+    }
 
     size_t protocol_pos = url.find("://");
     size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
@@ -60,7 +68,7 @@ void stream_direct_link(AppConfig& config, const std::string& url) {
     std::string safe_name = base_url;
     std::replace_if(safe_name.begin(), safe_name.end(), [](char c) { return !std::isalnum(c); }, '_');
     if (safe_name.length() > 50) safe_name = safe_name.substr(safe_name.length() - 50);
-    std::string cache_path = config.save_dir + "/" + stream_id + "_" + safe_name + ".bin";
+    std::string cache_path = config.save_dir + "/http_" + safe_name + ".bin";
 
     auto cache = std::make_shared<HttpCacheManager>(cache_path, file_size);
     cache->init();
@@ -68,11 +76,14 @@ void stream_direct_link(AppConfig& config, const std::string& url) {
     auto downloader = std::make_shared<HttpDownloader>(*cache, url);
     downloader->start();
 
-    auto proxy = std::make_shared<HttpProxyServer>(*cache, *downloader, url, config.port, stream_id, config.debug_mode);
+    // Assign a unique port to this proxy!
+    int my_proxy_port = next_proxy_port++;
+
+    auto proxy = std::make_shared<HttpProxyServer>(*cache, *downloader, url, my_proxy_port, stream_id, config.debug_mode);
     proxy->start();
 
-    std::string stream_url = std::format("http://localhost:{}/stream/{}", config.port, stream_id);
-    std::string abort_url = std::format("http://localhost:{}/abort/{}", config.port, stream_id);
+    std::string stream_url = std::format("http://localhost:{}/stream/{}", my_proxy_port, stream_id);
+    std::string abort_url = std::format("http://localhost:{}/abort/{}", my_proxy_port, stream_id);
     
     std::println("\n[*] Launching Universal HTTP Stream...");
     std::println("  => URL: {}", stream_url);

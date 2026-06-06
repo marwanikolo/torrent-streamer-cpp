@@ -13,6 +13,7 @@
 #include "AlertHandler.h"
 #include "HttpServer.h"
 #include "DirectLinkEngine.h"
+#include "ProcessManager.h"
 
 std::atomic<bool> interrupted{false};
 void signal_handler(int) { interrupted = true; }
@@ -79,7 +80,6 @@ int main(int argc, char* argv[]) {
     std::println("  list         - Show active torrent streams");
     std::println("  quit         - Shut down the daemon gracefully\n");
 
-    // Handle initial source passed via CLI arguments with quote-stripping safety
     if (!initial_source.empty()) {
         auto ns_start = initial_source.find_first_not_of(" \t\r\n\"'");
         if (ns_start != std::string::npos) {
@@ -90,10 +90,7 @@ int main(int argc, char* argv[]) {
 
         if (!initial_source.empty()) {
             if (initial_source.starts_with("http://") || initial_source.starts_with("https://")) {
-                std::thread([config, initial_source]() {
-                    AppConfig cfg = config;
-                    stream_direct_link(cfg, initial_source);
-                }).detach();
+                stream_direct_link(config, initial_source); // Synchronous call
             } else {
                 try {
                     handle_torrent(manager, config, initial_source);
@@ -138,7 +135,6 @@ int main(int argc, char* argv[]) {
         else if (line.starts_with("add ")) {
             std::string new_source = line.substr(4);
             
-            // 1. Strip spaces AND quotes (' or ") from the start and end of the pasted link
             auto ns_start = new_source.find_first_not_of(" \t\r\n\"'");
             if (ns_start != std::string::npos) {
                 new_source = new_source.substr(ns_start, new_source.find_last_not_of(" \t\r\n\"'") - ns_start + 1);
@@ -149,12 +145,8 @@ int main(int argc, char* argv[]) {
             if (new_source.empty()) continue;
 
             if (new_source.starts_with("http://") || new_source.starts_with("https://")) {
-                std::thread([config, new_source]() {
-                    AppConfig cfg = config;
-                    stream_direct_link(cfg, new_source);
-                }).detach();
+                stream_direct_link(config, new_source); // Synchronous call
             } else {
-                // 2. Safety Net: Catch libtorrent crashes so the daemon stays alive!
                 try {
                     handle_torrent(manager, config, new_source);
                 } catch (const std::exception& e) {
@@ -170,6 +162,7 @@ int main(int argc, char* argv[]) {
 
     std::println("\n[SYST] Shutting down daemon... waiting for threads to exit.");
     interrupted = true;
+    stop_player();
     svr.stop();
     
     if (server_thread.joinable()) server_thread.join();
