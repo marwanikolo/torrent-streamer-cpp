@@ -45,4 +45,5 @@ public:
     }
 };
 
-void handle_torrent(TorrentManager& manager, AppConfig& config, std::string source);
+// Updated signature with default parameter
+void handle_torrent(TorrentManager& manager, AppConfig& config, std::string source, bool auto_play_largest = false);

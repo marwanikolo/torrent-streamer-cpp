@@ -16,7 +16,8 @@
 
 extern std::atomic<bool> interrupted;
 
-void handle_torrent(TorrentManager& manager, AppConfig& config, std::string source) {
+// Updated signature
+void handle_torrent(TorrentManager& manager, AppConfig& config, std::string source, bool auto_play_largest) {
     interrupted = false;
     lt::add_torrent_params atp;
     std::string hash_str;
@@ -96,25 +97,41 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         std::println(" [{}] {} ({} MB)", i, files.file_path(lt::file_index_t(i)), files.file_size(lt::file_index_t(i)) / (1024 * 1024));
     }
 
-    std::string input;
-    std::print("\n[?] Enter file number(s) separated by commas (e.g. 0,2), or 'q' to cancel: ");
-    std::fflush(stdout);
-    std::getline(std::cin, input);
-
-    if (input == "q" || input == "Q") {
-        manager.ses.remove_torrent(h);
-        return;
-    }
-
+    // --- NEW AUTO-PLAY LOGIC IMPLEMENTED HERE ---
     std::vector<int> selected_indices;
-    std::stringstream ss_input(input);
-    std::string token;
-    while (std::getline(ss_input, token, ',')) {
-        try {
-            int idx = std::stoi(token);
-            if (idx >= 0 && idx < files.num_files()) selected_indices.push_back(idx);
-        } catch(...) {}
+
+    if (auto_play_largest) {
+        int largest_idx = 0;
+        std::int64_t max_size = 0;
+        for (int i = 0; i < files.num_files(); ++i) {
+            if (files.file_size(lt::file_index_t(i)) > max_size) {
+                max_size = files.file_size(lt::file_index_t(i));
+                largest_idx = i;
+            }
+        }
+        selected_indices.push_back(largest_idx);
+        std::println("\n[*] Web API Request: Auto-playing largest file -> {}", files.file_path(lt::file_index_t(largest_idx)));
+    } else {
+        std::string input;
+        std::print("\n[?] Enter file number(s) separated by commas (e.g. 0,2), or 'q' to cancel: ");
+        std::fflush(stdout);
+        std::getline(std::cin, input);
+
+        if (input == "q" || input == "Q") {
+            manager.ses.remove_torrent(h);
+            return;
+        }
+
+        std::stringstream ss_input(input);
+        std::string token;
+        while (std::getline(ss_input, token, ',')) {
+            try {
+                int idx = std::stoi(token);
+                if (idx >= 0 && idx < files.num_files()) selected_indices.push_back(idx);
+            } catch(...) {}
+        }
     }
+    // --------------------------------------------
 
     if (selected_indices.empty()) {
         std::println("[-] No valid files selected. Canceling torrent.");

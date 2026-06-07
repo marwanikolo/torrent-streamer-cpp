@@ -5,38 +5,52 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TorrentStreamer Dashboard</title>
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: #121212;
-            color: #ffffff;
-            margin: 0;
-            padding: 40px;
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background-color: #121212; color: #ffffff; margin: 0; padding: 40px; }
         .container { max-width: 800px; margin: 0 auto; }
         h1 { color: #00d2ff; border-bottom: 2px solid #333; padding-bottom: 10px; }
         .card { background-color: #1e1e1e; border-radius: 8px; padding: 20px; margin-top: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        .stream-item { 
-            background-color: #2a2a2a; padding: 15px; border-radius: 6px; 
-            margin-bottom: 10px; border-left: 4px solid #00d2ff;
-            display: flex; justify-content: space-between; align-items: center;
-        }
-        .stream-info { flex-grow: 1; }
-        .stream-id { color: #888; font-size: 0.85em; font-family: monospace; }
-        .empty-state { color: #666; font-style: italic; }
         
-        .btn-stop {
-            background-color: #ff4444; color: white; border: none; 
-            padding: 8px 16px; border-radius: 4px; font-weight: bold; cursor: pointer;
-            transition: background 0.2s;
-        }
-        .btn-stop:hover { background-color: #cc0000; }
+        .text-input { width: 100%; padding: 12px; border-radius: 4px; border: 1px solid #444; background: #2a2a2a; color: white; box-sizing: border-box; margin-bottom: 15px; font-size: 16px; }
+        .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
+        .btn-action { background-color: #333; color: #00d2ff; border: 1px solid #00d2ff; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+        .btn-action:hover { background-color: #00d2ff; color: #000; }
+        .btn-yt { border-color: #ff5555; color: #ff5555; }
+        .btn-yt:hover { background-color: #ff5555; color: white; }
+        .btn-power { background-color: #ff4444; color: white; border: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; cursor: pointer; }
+        .btn-stop { background-color: transparent; border: 1px solid #ff4444; color: #ff4444; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
+        .btn-stop:hover { background-color: #ff4444; color: white; }
+        .btn-playlist { background: none; border: none; color: #00d2ff; text-align: left; cursor: pointer; padding: 5px 0; text-decoration: underline; font-size: 15px; }
+
+        .stream-item { background-color: #2a2a2a; padding: 15px; border-radius: 6px; margin-bottom: 10px; border-left: 4px solid #00d2ff; display: flex; justify-content: space-between; align-items: center; }
+        .stream-info { flex-grow: 1; overflow: hidden; }
+        .stream-id { color: #888; font-size: 0.85em; font-family: monospace; display: block; margin-top: 5px; }
+        .empty-state { color: #666; font-style: italic; }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h1>C++ Media Engine</h1>
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h1>C++ Media Engine</h1>
+        <button class="btn-power" onclick="quitDaemon()">⏻ Power Off</button>
+    </div>
     
+    <div class="card">
+        <h3>Launch Stream</h3>
+        <input type="text" id="url-input" class="text-input" placeholder="Paste Torrent, Magnet, YouTube link, or search query...">
+        
+        <div class="btn-group">
+            <button class="btn-action" onclick="postAction('/api/play/torrent')">Auto-Play Torrent</button>
+            <button class="btn-action" onclick="postAction('/api/play/direct')">Add Direct Stream</button>
+            <button class="btn-action btn-yt" onclick="fetchYt()">Extract yt-dlp Formats</button>
+        </div>
+
+        <div id="yt-panel" style="display: none; margin-top: 20px; padding-top: 15px; border-top: 1px solid #333;">
+            <div id="yt-loading" style="display: none; color: #aaa;">Extracting formats... please wait.</div>
+            <div id="yt-results"></div>
+        </div>
+    </div>
+
     <div class="card">
         <h3>Active Streams</h3>
         <div id="streams-container">
@@ -46,59 +60,110 @@
 </div>
 
 <script>
+    async function postAction(endpoint) {
+        const url = document.getElementById('url-input').value;
+        if (!url) return alert("Please enter a link!");
+        await fetch(endpoint, { method: 'POST', body: JSON.stringify({url}) });
+        document.getElementById('url-input').value = '';
+        fetchStatus();
+    }
+
+    async function fetchYt() {
+        const url = document.getElementById('url-input').value;
+        if (!url) return alert("Please enter a YouTube link or search query!");
+        
+        document.getElementById('yt-panel').style.display = 'block';
+        document.getElementById('yt-loading').style.display = 'block';
+        document.getElementById('yt-results').innerHTML = '';
+
+        try {
+            const res = await fetch('/api/yt/fetch', { method: 'POST', body: JSON.stringify({url}) });
+            const data = await res.json();
+            document.getElementById('yt-loading').style.display = 'none';
+
+            if (data.is_playlist) {
+                let html = '<h4 style="margin-top:0;">Playlist / Search Results:</h4><div style="display:flex; flex-direction:column; gap:5px;">';
+                data.entries.forEach(e => {
+                    html += `<button onclick="document.getElementById('url-input').value='${e.url}'; fetchYt();" class="btn-playlist">${e.title}</button>`;
+                });
+                html += '</div>';
+                document.getElementById('yt-results').innerHTML = html;
+            } else {
+                let vOptions = '<option value="-1">-- Select Video --</option>';
+                let aOptions = '<option value="-1">-- None (Pre-merged or Muted) --</option>';
+                
+                data.formats.forEach(f => {
+                    const label = `[${f.id}] ${f.resolution} | ${f.ext} | v: ${f.vcodec} | a: ${f.acodec} | ${f.size.toFixed(2)} MB`;
+                    if (f.vcodec !== "none") vOptions += `<option value="${f.id}">${label}</option>`;
+                    if (f.acodec !== "none") aOptions += `<option value="${f.id}">${label}</option>`;
+                });
+
+                document.getElementById('yt-results').innerHTML = `
+                    <h4 style="margin-top:0;">Select DASH Formats:</h4>
+                    <select id="yt-v" class="text-input" style="padding:8px;">${vOptions}</select>
+                    <select id="yt-a" class="text-input" style="padding:8px;">${aOptions}</select>
+                    <button class="btn-action btn-yt" onclick="playYt('${url}')">▶ Play Selection</button>
+                `;
+            }
+        } catch (e) {
+            document.getElementById('yt-loading').innerText = "Failed to fetch formats. Check server logs.";
+        }
+    }
+
+    async function playYt(originalUrl) {
+        const v_idx = parseInt(document.getElementById('yt-v').value);
+        const a_idx = parseInt(document.getElementById('yt-a').value);
+        if (v_idx === -1) return alert("Please select a video format!");
+        
+        await fetch('/api/yt/play', { 
+            method: 'POST', 
+            body: JSON.stringify({ url: originalUrl, v_idx, a_idx }) 
+        });
+        document.getElementById('yt-panel').style.display = 'none';
+        document.getElementById('url-input').value = '';
+        fetchStatus();
+    }
+
     async function fetchStatus() {
         try {
             const response = await fetch('/api/status');
             const data = await response.json();
             const container = document.getElementById('streams-container');
             container.innerHTML = '';
-
             let hasStreams = false;
 
             data.torrents.forEach(t => {
                 hasStreams = true;
                 container.innerHTML += `
                     <div class="stream-item">
-                        <div class="stream-info">
-                            <strong>🎬 ${t.name}</strong><br>
-                            <span class="stream-id">Torrent Hash: ${t.id}</span>
-                        </div>
+                        <div class="stream-info"><strong>🎬 ${t.name}</strong><span class="stream-id">Hash: ${t.id}</span></div>
                         <button class="btn-stop" onclick="stopStream('${t.id}')">Stop</button>
                     </div>`;
             });
-
             data.direct_streams.forEach(d => {
                 hasStreams = true;
-                const prefix = d.id.split('_')[0].toUpperCase();
                 container.innerHTML += `
                     <div class="stream-item">
-                        <div class="stream-info">
-                            <strong>🌐 ${prefix} STREAM</strong><br>
-                            <span class="stream-id">ID: ${d.id}</span>
-                        </div>
+                        <div class="stream-info"><strong>🌐 WEB STREAM</strong><span class="stream-id">ID: ${d.id}</span></div>
                         <button class="btn-stop" onclick="stopStream('${d.id}')">Stop</button>
                     </div>`;
             });
 
-            if (!hasStreams) {
-                container.innerHTML = '<p class="empty-state">No active streams running.</p>';
-            }
+            if (!hasStreams) container.innerHTML = '<p class="empty-state">No active streams running.</p>';
         } catch (error) {
             document.getElementById('streams-container').innerHTML = '<p class="empty-state" style="color: #ff5555;">Lost connection to C++ Daemon.</p>';
         }
     }
 
     async function stopStream(streamId) {
-        try {
-            await fetch('/api/stop', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: streamId })
-            });
-            fetchStatus(); // Instantly refresh the UI!
-        } catch (error) {
-            console.error("Error stopping stream:", error);
-            alert("Failed to send stop command to daemon.");
+        await fetch('/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: streamId }) });
+        fetchStatus(); 
+    }
+
+    async function quitDaemon() {
+        if(confirm("Shut down the C++ daemon and kill all streams?")) {
+            await fetch('/api/quit', { method: 'POST' });
+            document.body.innerHTML = '<h1 style="color:#ff5555; text-align:center; margin-top:20%">Daemon Offline.</h1>';
         }
     }
 
