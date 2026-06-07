@@ -145,6 +145,19 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                 state->shutting_down.store(true);
                 state->cv.notify_all(); 
                 stop_player_by_pid(state->player_pid); 
+
+                // --- RESTORED: FASTRESUME LOGIC ---
+                if (state->h.is_valid() && state->h.status().has_metadata) {
+                    state->resume_data_saved.store(false);
+                    state->h.save_resume_data(lt::torrent_handle::save_info_dict);
+                    int timeout = 0;
+                    while (!state->resume_data_saved.load() && timeout < 30) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        timeout++;
+                    }
+                }
+                // ----------------------------------
+
                 manager.ses.remove_torrent(state->h); 
                 manager.active_streams.erase(it_tor);
                 found = true;
@@ -234,3 +247,4 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         );
     });
 }
+

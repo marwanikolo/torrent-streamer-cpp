@@ -63,7 +63,8 @@ int main(int argc, char* argv[]) {
                                       lt::alert_category::storage | lt::alert_category::piece_progress;
                      
     if (config.debug_mode) {
-        alert_mask |= lt::alert_category::torrent_log | lt::alert_category::peer_log;
+        // We purposely omit `torrent_log` and `peer_log` here to prevent massive handshake spam.
+        // The telemetry ticker in AlertHandler will handle our clean logging.
         std::println("\n[!] DEBUG MODE ENABLED: Writing verbose trace to 'streamer_debug.log'");
         std::ofstream("streamer_debug.log", std::ios::trunc).close();
     }
@@ -176,6 +177,23 @@ int main(int argc, char* argv[]) {
                     
                     // Kill the MPV/VLC Window
                     stop_player_by_pid(state->player_pid); 
+                    
+                    // --- RESTORED: FASTRESUME LOGIC ---
+                    if (state->h.is_valid() && state->h.status().has_metadata) {
+                        std::print("[*] Saving fastresume data... ");
+                        std::fflush(stdout);
+                        state->resume_data_saved.store(false);
+                        state->h.save_resume_data(lt::torrent_handle::save_info_dict);
+                        
+                        // Wait up to 3 seconds for AlertHandler to write the file
+                        int timeout = 0;
+                        while (!state->resume_data_saved.load() && timeout < 30) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            timeout++;
+                        }
+                        std::println("Done!");
+                    }
+                    // ----------------------------------
                     
                     // Tell libtorrent to sever swarm connections and remove the torrent
                     manager.ses.remove_torrent(state->h); 
@@ -341,6 +359,37 @@ int main(int argc, char* argv[]) {
     }
 
     std::println("\n[SYST] Shutting down daemon... waiting for threads to exit.");
+    
+    // --- RESTORED: GLOBAL FASTRESUME ON QUIT ---
+    manager.ses.pause();
+    int outstanding = 0;
+    for (auto& [hash, state] : manager.active_streams) {
+        if (state->h.is_valid() && state->h.status().has_metadata) {
+            state->resume_data_saved.store(false);
+            state->h.save_resume_data(lt::torrent_handle::save_info_dict);
+            outstanding++;
+        }
+    }
+    if (outstanding > 0) {
+        std::print("[*] Saving {} fastresume files to disk... ", outstanding);
+        std::fflush(stdout);
+        int timeout = 0;
+        bool all_saved = false;
+        while (!all_saved && timeout < 50) {
+            all_saved = true;
+            for (auto& [hash, state] : manager.active_streams) {
+                if (state->h.is_valid() && state->h.status().has_metadata && !state->resume_data_saved.load()) {
+                    all_saved = false;
+                    break;
+                }
+            }
+            if (!all_saved) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            timeout++;
+        }
+        std::println("Done!");
+    }
+    // -------------------------------------------
+
     interrupted = true;
     stop_player();
     svr.stop();
