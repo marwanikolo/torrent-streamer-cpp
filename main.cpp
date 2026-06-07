@@ -6,6 +6,7 @@
 #include <thread>
 #include <unordered_map>
 #include <algorithm>
+#include <shared_mutex>
 #include <httplib.h>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -147,17 +148,46 @@ int main(int argc, char* argv[]) {
         } 
         else if (line.starts_with("stop ")) {
             std::string target = line.substr(5);
-            auto it = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
+            bool found = false;
+
+            // 1. Search Direct Web Streams
+            auto it_dir = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
                                    [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
             
-            if (it != active_direct_streams.end()) {
-                it->second.cancel_token->store(true);
-                stop_player_by_pid(it->second.player_pid);
-                std::println("[+] Successfully stopped and cleaned up stream: {}", it->first);
-                active_direct_streams.erase(it);
-            } else {
-                std::println("[-] Could not find an active web stream matching: {}", target);
-                std::println("    (Note: Torrent stopping currently requires manual player closure).");
+            if (it_dir != active_direct_streams.end()) {
+                it_dir->second.cancel_token->store(true);
+                stop_player_by_pid(it_dir->second.player_pid);
+                std::println("[+] Successfully stopped Direct Stream: {}", it_dir->first);
+                active_direct_streams.erase(it_dir);
+                found = true;
+            } 
+            // 2. Search BitTorrent Streams
+            else {
+                std::unique_lock<std::shared_mutex> lock(manager.registry_mtx);
+                auto it_tor = std::find_if(manager.active_streams.begin(), manager.active_streams.end(),
+                                       [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
+                
+                if (it_tor != manager.active_streams.end()) {
+                    auto state = it_tor->second;
+                    
+                    // Safely terminate the HTTP socket threads
+                    state->shutting_down.store(true);
+                    state->cv.notify_all(); 
+                    
+                    // Kill the MPV/VLC Window
+                    stop_player_by_pid(state->player_pid); 
+                    
+                    // Tell libtorrent to sever swarm connections and remove the torrent
+                    manager.ses.remove_torrent(state->h); 
+                    
+                    std::println("[+] Successfully stopped Torrent Stream: {}", it_tor->first);
+                    manager.active_streams.erase(it_tor);
+                    found = true;
+                }
+            }
+
+            if (!found) {
+                std::println("[-] Could not find an active stream matching: {}", target);
             }
         }
         else if (line == "yt") {
@@ -192,7 +222,6 @@ int main(int argc, char* argv[]) {
                         std::println("[*] Fetching stream formats (This might take a moment for playlists)...");
                         auto res = parse_ytdlp_json(yt_line);
                         
-                        // ===== NEW: PLAYLIST HANDLER =====
                         if (res.is_playlist) {
                             std::println("\n======================================================================");
                             std::println("                 PLAYLIST / SEARCH RESULTS");
@@ -219,7 +248,6 @@ int main(int argc, char* argv[]) {
                             } catch(...) { continue; }
                         }
 
-                        // ===== STANDARD FORMAT MENU =====
                         if (res.formats.empty()) {
                             std::println("[-] No valid streaming formats found.");
                             continue;
