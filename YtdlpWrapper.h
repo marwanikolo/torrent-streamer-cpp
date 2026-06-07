@@ -15,5 +15,15 @@ struct YtdlpFormat {
     double filesize_mb;
 };
 
-// Intercepts the JSON and returns a list of all available streams
-std::vector<YtdlpFormat> parse_ytdlp_json(const std::string& cmd);
+struct YtdlpPlaylistEntry {
+    std::string title;
+    std::string url;
+};
+
+struct YtdlpResult {
+    bool is_playlist = false;
+    std::vector<YtdlpFormat> formats;
+    std::vector<YtdlpPlaylistEntry> entries;
+};
+
+YtdlpResult parse_ytdlp_json(const std::string& cmd);

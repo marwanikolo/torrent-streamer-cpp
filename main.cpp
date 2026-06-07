@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <print>
 #include <thread>
+#include <unordered_map>
+#include <algorithm>
 #include <httplib.h>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -18,6 +20,9 @@
 
 std::atomic<bool> interrupted{false};
 void signal_handler(int) { interrupted = true; }
+
+// Global Registry for Active Direct/Web Streams
+std::unordered_map<std::string, DirectStreamHandle> active_direct_streams;
 
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
@@ -78,6 +83,7 @@ int main(int argc, char* argv[]) {
     std::println("[SYST] Local HTTP Server listening on port {}", config.port);
     std::println("\nCommands:");
     std::println("  add <link>   - Add a new magnet, .torrent, or HTTP link");
+    std::println("  stop <url>   - Stop a specific running stream");
     std::println("  yt           - Enter interactive yt-dlp sub-shell");
     std::println("  list         - Show active torrent streams");
     std::println("  quit         - Shut down the daemon gracefully\n");
@@ -92,7 +98,8 @@ int main(int argc, char* argv[]) {
 
         if (!initial_source.empty()) {
             if (initial_source.starts_with("http://") || initial_source.starts_with("https://")) {
-                stream_direct_link(config, initial_source); 
+                auto handle = stream_direct_link(config, initial_source); 
+                active_direct_streams[handle.stream_id] = handle;
             } else {
                 try {
                     handle_torrent(manager, config, initial_source);
@@ -128,13 +135,31 @@ int main(int argc, char* argv[]) {
         } 
         else if (line == "list") {
             std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
-            std::println("Active Streams: {}", manager.active_streams.size());
+            std::println("\nActive Torrent Streams: {}", manager.active_streams.size());
             for (const auto& [hash, state] : manager.active_streams) {
                 std::println("  => [{}] {}", hash.substr(0, 8), state->file_path);
                 std::println("     URL: http://localhost:{}/stream/{}", config.port, hash);
             }
+            std::println("\nActive Direct Web Streams: {}", active_direct_streams.size());
+            for (const auto& [id, handle] : active_direct_streams) {
+                std::println("  => {}", id);
+            }
         } 
-        // --- THE NESTED YT-DLP SUB-SHELL ---
+        else if (line.starts_with("stop ")) {
+            std::string target = line.substr(5);
+            auto it = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
+                                   [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
+            
+            if (it != active_direct_streams.end()) {
+                it->second.cancel_token->store(true);
+                stop_player_by_pid(it->second.player_pid);
+                std::println("[+] Successfully stopped and cleaned up stream: {}", it->first);
+                active_direct_streams.erase(it);
+            } else {
+                std::println("[-] Could not find an active web stream matching: {}", target);
+                std::println("    (Note: Torrent stopping currently requires manual player closure).");
+            }
+        }
         else if (line == "yt") {
             std::println("\n[SYST] Entering yt-dlp mode.");
             std::println("       Type standard yt-dlp commands (e.g. yt-dlp -F <url>)");
@@ -162,13 +187,40 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // If user wants JSON dump, we intercept it and show a menu!
                 if (yt_line.find("-J") != std::string::npos || yt_line.find("--dump-json") != std::string::npos) {
                     try {
-                        std::println("[*] Fetching and parsing stream formats...");
-                        auto formats = parse_ytdlp_json(yt_line);
+                        std::println("[*] Fetching stream formats (This might take a moment for playlists)...");
+                        auto res = parse_ytdlp_json(yt_line);
                         
-                        if (formats.empty()) {
+                        // ===== NEW: PLAYLIST HANDLER =====
+                        if (res.is_playlist) {
+                            std::println("\n======================================================================");
+                            std::println("                 PLAYLIST / SEARCH RESULTS");
+                            std::println("======================================================================");
+                            for (size_t i = 0; i < res.entries.size(); ++i) {
+                                std::println(" [{}] {}", i, res.entries[i].title);
+                            }
+                            std::print("\n[?] Enter video number to extract formats, or 'q' to cancel: ");
+                            std::fflush(stdout);
+                            std::string choice;
+                            std::getline(std::cin, choice);
+                            if (choice == "q" || choice == "Q") continue;
+                            
+                            try {
+                                int idx = std::stoi(choice);
+                                if (idx >= 0 && idx < res.entries.size()) {
+                                    std::string fetch_cmd = "yt-dlp -J \"" + res.entries[idx].url + "\"";
+                                    std::println("[*] Resolving formats for: {}", res.entries[idx].title);
+                                    res = parse_ytdlp_json(fetch_cmd);
+                                } else {
+                                    std::println("[-] Invalid selection.");
+                                    continue;
+                                }
+                            } catch(...) { continue; }
+                        }
+
+                        // ===== STANDARD FORMAT MENU =====
+                        if (res.formats.empty()) {
                             std::println("[-] No valid streaming formats found.");
                             continue;
                         }
@@ -176,9 +228,8 @@ int main(int argc, char* argv[]) {
                         std::println("\n======================================================================");
                         std::println("                 AVAILABLE YT-DLP FORMATS");
                         std::println("======================================================================");
-                        for (size_t i = 0; i < formats.size(); ++i) {
-                            const auto& f = formats[i];
-                            // Clean table format: [Index] FormatID | EXT | Resolution (Video, Audio) | Size
+                        for (size_t i = 0; i < res.formats.size(); ++i) {
+                            const auto& f = res.formats[i];
                             std::println(" [{}] {:<6} | {:<4} | {:<12} (v: {}, a: {}) | {:.2f} MB", 
                                 i, f.format_id, f.ext, f.resolution, f.vcodec, f.acodec, f.filesize_mb);
                         }
@@ -194,7 +245,6 @@ int main(int argc, char* argv[]) {
                             int v_idx = -1;
                             int a_idx = -1;
                             
-                            // Check if user specified Video+Audio (e.g. 160+140)
                             size_t plus_pos = choice.find('+');
                             if (plus_pos != std::string::npos) {
                                 v_idx = std::stoi(choice.substr(0, plus_pos));
@@ -203,17 +253,18 @@ int main(int argc, char* argv[]) {
                                 v_idx = std::stoi(choice);
                             }
 
-                            if (v_idx >= 0 && v_idx < formats.size()) {
+                            if (v_idx >= 0 && v_idx < res.formats.size()) {
                                 std::string a_url = "";
-                                if (a_idx >= 0 && a_idx < formats.size()) {
-                                    std::println("\n[+] Selected Video [{}] + Audio [{}] - Proxying streams...", formats[v_idx].format_id, formats[a_idx].format_id);
-                                    a_url = formats[a_idx].url;
+                                if (a_idx >= 0 && a_idx < res.formats.size()) {
+                                    std::println("\n[+] Selected Video [{}] + Audio [{}] - Proxying streams...", res.formats[v_idx].format_id, res.formats[a_idx].format_id);
+                                    a_url = res.formats[a_idx].url;
                                 } else {
-                                    std::println("\n[+] Selected Format [{}] - Proxying stream...", formats[v_idx].format_id);
+                                    std::println("\n[+] Selected Format [{}] - Proxying stream...", res.formats[v_idx].format_id);
                                 }
                                 
                                 AppConfig cfg = config;
-                                stream_direct_link(cfg, formats[v_idx].url, formats[v_idx].headers, a_url);
+                                auto handle = stream_direct_link(cfg, res.formats[v_idx].url, res.formats[v_idx].headers, a_url);
+                                active_direct_streams[handle.stream_id] = handle;
                             } else {
                                 std::println("[-] Invalid selection.");
                             }
@@ -226,7 +277,6 @@ int main(int argc, char* argv[]) {
                     }
                 } 
                 else {
-                    // Standard yt-dlp command. Just execute it natively in the shell!
                     int ret = system(yt_line.c_str());
                     if (ret != 0) {
                         std::println(stderr, "[-] yt-dlp exited with code: {}", ret);
@@ -247,18 +297,18 @@ int main(int argc, char* argv[]) {
             if (new_source.empty()) continue;
 
             if (new_source.starts_with("http://") || new_source.starts_with("https://")) {
-                stream_direct_link(config, new_source); 
+                auto handle = stream_direct_link(config, new_source); 
+                active_direct_streams[handle.stream_id] = handle;
             } else {
                 try {
                     handle_torrent(manager, config, new_source);
                 } catch (const std::exception& e) {
                     std::println(stderr, "[-] Failed to parse torrent/magnet: {}", e.what());
-                    std::println(stderr, "[-] Returning to daemon prompt.");
                 }
             }
         } 
         else {
-            std::println("Unknown command. Use 'add <link>', 'yt', 'list', or 'quit'.");
+            std::println("Unknown command. Use 'add <link>', 'stop <url>', 'yt', 'list', or 'quit'.");
         }
     }
 

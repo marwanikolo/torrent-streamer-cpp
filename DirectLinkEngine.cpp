@@ -25,8 +25,9 @@ struct ProxyInstance {
     std::string abort_url;
 };
 
-void stream_direct_link(AppConfig& config, const std::string& url, const httplib::Headers& headers, const std::string& audio_url) {
+DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url, const httplib::Headers& headers, const std::string& audio_url) {
     interrupted = false;
+    auto cancel_token = std::make_shared<std::atomic<bool>>(false);
     std::println("\n[*] Initializing Direct HTTP Engine...");
 
     if (next_proxy_port.load() == 0) {
@@ -112,11 +113,13 @@ void stream_direct_link(AppConfig& config, const std::string& url, const httplib
     }
 
     std::println("\n[*] Launching Universal HTTP Stream...");
-    launch_player(config, video_proxy.stream_url, video_proxy.abort_url, audio_proxy.stream_url);
+    pid_t pid = launch_player(config, video_proxy.stream_url, video_proxy.abort_url, audio_proxy.stream_url);
 
-    // Keep both proxies alive until interrupted by the daemon
-    std::thread([video_proxy, audio_proxy]() {
-        while (!interrupted.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    // Keep proxies alive until interrupted globally OR cancelled locally via token
+    std::thread([video_proxy, audio_proxy, cancel_token]() {
+        while (!interrupted.load() && !cancel_token->load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
         
         video_proxy.proxy->stop();
         video_proxy.downloader->stop();
@@ -128,4 +131,6 @@ void stream_direct_link(AppConfig& config, const std::string& url, const httplib
             audio_proxy.cache->save_state();
         }
     }).detach();
+
+    return { video_proxy.stream_url, pid, cancel_token };
 }
