@@ -63,6 +63,10 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         atp.trackers.push_back(wss);
     }
 
+    // --- RESTORED: FORCE SEQUENTIAL DOWNLOADING ---
+    atp.flags |= lt::torrent_flags::sequential_download;
+    // ----------------------------------------------
+
     lt::torrent_handle h = manager.ses.add_torrent(atp);
 
     if (!h.status().has_metadata) {
@@ -97,7 +101,7 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         std::println(" [{}] {} ({} MB)", i, files.file_path(lt::file_index_t(i)), files.file_size(lt::file_index_t(i)) / (1024 * 1024));
     }
 
-    // --- NEW AUTO-PLAY LOGIC IMPLEMENTED HERE ---
+    // --- AUTO-PLAY LOGIC ---
     std::vector<int> selected_indices;
 
     if (auto_play_largest) {
@@ -131,7 +135,6 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
             } catch(...) {}
         }
     }
-    // --------------------------------------------
 
     if (selected_indices.empty()) {
         std::println("[-] No valid files selected. Canceling torrent.");
@@ -157,6 +160,22 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         state->first_piece = state->file_offset / state->piece_length;
         state->last_piece = (state->file_offset + state->file_size - 1) / state->piece_length;
 
+        // --- THE FIX: CRUSH DEFAULT PIECE PRIORITIES ---
+        // file_priority() just set all pieces in this file to priority 4.
+        // We must zero them out so WindowManager has exclusive control.
+        for (int p = state->first_piece; p <= state->last_piece; ++p) {
+            h.piece_priority(lt::piece_index_t(p), lt::dont_download);
+        }
+        // -----------------------------------------------
+
+        // --- RESTORED: FAST START METADATA FETCHING ---
+        // Instantly demand ONLY the first and last pieces
+        h.piece_priority(lt::piece_index_t(state->first_piece), lt::top_priority);
+        h.piece_priority(lt::piece_index_t(state->last_piece), lt::top_priority);
+        h.set_piece_deadline(lt::piece_index_t(state->first_piece), 0, lt::torrent_handle::alert_when_available);
+        h.set_piece_deadline(lt::piece_index_t(state->last_piece), 0, lt::torrent_handle::alert_when_available);
+        // ----------------------------------------------
+
         std::string stream_id = hash_str + "_" + std::to_string(idx);
         manager.add_stream(stream_id, state);
 
@@ -166,7 +185,7 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         std::println("  => [{}] {} ({} MB)", idx, files.file_path(lt::file_index_t(idx)), files.file_size(lt::file_index_t(idx)) / (1024 * 1024));
         std::println("     URL: {}", stream_url);
 
-        pid_t pid = launch_player(config, stream_url, abort_url);
+        pid_t pid = launch_player(config, stream_url, abort_url, "");
         state->player_pid = pid;
     }
     std::println("");
