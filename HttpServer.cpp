@@ -1,12 +1,17 @@
 #include "HttpServer.h"
 #include "WindowManager.h"
 #include "Utils.h"
+#include "DirectLinkEngine.h" 
 #include <thread>
 #include <chrono>
 #include <fstream>
 #include <algorithm>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
 
 extern std::atomic<bool> interrupted;
+extern std::unordered_map<std::string, DirectStreamHandle> active_direct_streams;
 
 void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::string& hls_playlist, AppConfig& config) {
     bool debug = config.debug_mode;
@@ -19,6 +24,39 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
             write_debug_log(debug, "[HTTP] {} {} | Range: {} | HTTP Status: {}", req.method, req.path, range, res.status);
         });
     }
+
+    // --- 1. MOUNT THE WEB UI DIRECTORY ---
+    svr.set_mount_point("/", "./public");
+    
+    // --- 2. BUILD THE REST API ---
+    svr.Get("/api/status", [&manager, &config](const httplib::Request&, httplib::Response& res) {
+        json response = {
+            {"torrents", json::array()},
+            {"direct_streams", json::array()}
+        };
+
+        // Grab active torrents
+        {
+            std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
+            for (const auto& [hash, state] : manager.active_streams) {
+                response["torrents"].push_back({
+                    {"id", hash},
+                    {"name", state->file_path.substr(state->file_path.find_last_of('/') + 1)},
+                    {"url", "http://localhost:" + std::to_string(config.port) + "/stream/" + hash}
+                });
+            }
+        }
+
+        // Grab active web streams
+        for (const auto& [id, handle] : active_direct_streams) {
+            response["direct_streams"].push_back({
+                {"id", id},
+                {"url", handle.stream_id} 
+            });
+        }
+
+        res.set_content(response.dump(), "application/json");
+    });
 
     svr.Get("/playlist.m3u8", [&hls_playlist](const httplib::Request&, httplib::Response& res) {
         if (!hls_playlist.empty()) res.set_content(hls_playlist, "application/vnd.apple.mpegurl");

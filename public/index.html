@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TorrentStreamer Dashboard</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #121212;
+            color: #ffffff;
+            margin: 0;
+            padding: 40px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #00d2ff;
+            border-bottom: 2px solid #333;
+            padding-bottom: 10px;
+        }
+        .card {
+            background-color: #1e1e1e;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        .stream-item {
+            background-color: #2a2a2a;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            border-left: 4px solid #00d2ff;
+        }
+        .stream-id {
+            color: #888;
+            font-size: 0.85em;
+            font-family: monospace;
+        }
+        .empty-state {
+            color: #666;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>C++ Media Engine</h1>
+    
+    <div class="card">
+        <h3>Active Streams</h3>
+        <div id="streams-container">
+            <p class="empty-state">Loading streams from C++ backend...</p>
+        </div>
+    </div>
+</div>
+
+<script>
+    async function fetchStatus() {
+        try {
+            const response = await fetch('/api/status');
+            const data = await response.json();
+            const container = document.getElementById('streams-container');
+            container.innerHTML = '';
+
+            let hasStreams = false;
+
+            // Render Torrents
+            data.torrents.forEach(t => {
+                hasStreams = true;
+                container.innerHTML += `
+                    <div class="stream-item">
+                        <strong>🎬 ${t.name}</strong><br>
+                        <span class="stream-id">Torrent Hash: ${t.id}</span>
+                    </div>`;
+            });
+
+            // Render Direct Links
+            data.direct_streams.forEach(d => {
+                hasStreams = true;
+                container.innerHTML += `
+                    <div class="stream-item">
+                        <strong>🌐 ${d.id.split('_')[0].toUpperCase()} STREAM</strong><br>
+                        <span class="stream-id">ID: ${d.id}</span>
+                    </div>`;
+            });
+
+            if (!hasStreams) {
+                container.innerHTML = '<p class="empty-state">No active streams running.</p>';
+            }
+        } catch (error) {
+            document.getElementById('streams-container').innerHTML = '<p class="empty-state" style="color: #ff5555;">Lost connection to C++ Daemon.</p>';
+        }
+    }
+
+    // Poll the C++ engine every 2 seconds
+    setInterval(fetchStatus, 2000);
+    fetchStatus();
+</script>
+
+</body>
+</html>
