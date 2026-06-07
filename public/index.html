@@ -12,38 +12,24 @@
             margin: 0;
             padding: 40px;
         }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { color: #00d2ff; border-bottom: 2px solid #333; padding-bottom: 10px; }
+        .card { background-color: #1e1e1e; border-radius: 8px; padding: 20px; margin-top: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .stream-item { 
+            background-color: #2a2a2a; padding: 15px; border-radius: 6px; 
+            margin-bottom: 10px; border-left: 4px solid #00d2ff;
+            display: flex; justify-content: space-between; align-items: center;
         }
-        h1 {
-            color: #00d2ff;
-            border-bottom: 2px solid #333;
-            padding-bottom: 10px;
+        .stream-info { flex-grow: 1; }
+        .stream-id { color: #888; font-size: 0.85em; font-family: monospace; }
+        .empty-state { color: #666; font-style: italic; }
+        
+        .btn-stop {
+            background-color: #ff4444; color: white; border: none; 
+            padding: 8px 16px; border-radius: 4px; font-weight: bold; cursor: pointer;
+            transition: background 0.2s;
         }
-        .card {
-            background-color: #1e1e1e;
-            border-radius: 8px;
-            padding: 20px;
-            margin-top: 20px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-        }
-        .stream-item {
-            background-color: #2a2a2a;
-            padding: 15px;
-            border-radius: 6px;
-            margin-bottom: 10px;
-            border-left: 4px solid #00d2ff;
-        }
-        .stream-id {
-            color: #888;
-            font-size: 0.85em;
-            font-family: monospace;
-        }
-        .empty-state {
-            color: #666;
-            font-style: italic;
-        }
+        .btn-stop:hover { background-color: #cc0000; }
     </style>
 </head>
 <body>
@@ -69,23 +55,28 @@
 
             let hasStreams = false;
 
-            // Render Torrents
             data.torrents.forEach(t => {
                 hasStreams = true;
                 container.innerHTML += `
                     <div class="stream-item">
-                        <strong>🎬 ${t.name}</strong><br>
-                        <span class="stream-id">Torrent Hash: ${t.id}</span>
+                        <div class="stream-info">
+                            <strong>🎬 ${t.name}</strong><br>
+                            <span class="stream-id">Torrent Hash: ${t.id}</span>
+                        </div>
+                        <button class="btn-stop" onclick="stopStream('${t.id}')">Stop</button>
                     </div>`;
             });
 
-            // Render Direct Links
             data.direct_streams.forEach(d => {
                 hasStreams = true;
+                const prefix = d.id.split('_')[0].toUpperCase();
                 container.innerHTML += `
                     <div class="stream-item">
-                        <strong>🌐 ${d.id.split('_')[0].toUpperCase()} STREAM</strong><br>
-                        <span class="stream-id">ID: ${d.id}</span>
+                        <div class="stream-info">
+                            <strong>🌐 ${prefix} STREAM</strong><br>
+                            <span class="stream-id">ID: ${d.id}</span>
+                        </div>
+                        <button class="btn-stop" onclick="stopStream('${d.id}')">Stop</button>
                     </div>`;
             });
 
@@ -97,7 +88,20 @@
         }
     }
 
-    // Poll the C++ engine every 2 seconds
+    async function stopStream(streamId) {
+        try {
+            await fetch('/api/stop', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: streamId })
+            });
+            fetchStatus(); // Instantly refresh the UI!
+        } catch (error) {
+            console.error("Error stopping stream:", error);
+            alert("Failed to send stop command to daemon.");
+        }
+    }
+
     setInterval(fetchStatus, 2000);
     fetchStatus();
 </script>

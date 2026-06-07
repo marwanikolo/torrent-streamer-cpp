@@ -2,6 +2,7 @@
 #include "WindowManager.h"
 #include "Utils.h"
 #include "DirectLinkEngine.h" 
+#include "ProcessManager.h" 
 #include <thread>
 #include <chrono>
 #include <fstream>
@@ -28,7 +29,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
     // --- 1. MOUNT THE WEB UI DIRECTORY ---
     svr.set_mount_point("/", "./public");
     
-    // --- 2. BUILD THE REST API ---
+    // --- 2. BUILD THE REST API (STATUS) ---
     svr.Get("/api/status", [&manager, &config](const httplib::Request&, httplib::Response& res) {
         json response = {
             {"torrents", json::array()},
@@ -56,6 +57,55 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         }
 
         res.set_content(response.dump(), "application/json");
+    });
+
+    // --- 3. BUILD THE REST API (STOP STREAM) ---
+    svr.Post("/api/stop", [&manager, debug](const httplib::Request& req, httplib::Response& res) {
+        json req_body;
+        try {
+            req_body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            return;
+        }
+
+        std::string target = req_body.value("id", "");
+        bool found = false;
+
+        // 1. Search Direct Web Streams
+        auto it_dir = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
+                               [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
+
+        if (it_dir != active_direct_streams.end()) {
+            it_dir->second.cancel_token->store(true);
+            stop_player_by_pid(it_dir->second.player_pid);
+            active_direct_streams.erase(it_dir);
+            found = true;
+        } 
+        // 2. Search BitTorrent Streams
+        else {
+            std::unique_lock<std::shared_mutex> lock(manager.registry_mtx);
+            auto it_tor = std::find_if(manager.active_streams.begin(), manager.active_streams.end(),
+                                   [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
+
+            if (it_tor != manager.active_streams.end()) {
+                auto state = it_tor->second;
+                state->shutting_down.store(true);
+                state->cv.notify_all(); 
+                stop_player_by_pid(state->player_pid); 
+                manager.ses.remove_torrent(state->h); 
+                manager.active_streams.erase(it_tor);
+                found = true;
+            }
+        }
+
+        if (found) {
+            write_debug_log(debug, "[HTTP] API successfully killed stream: {}", target);
+            res.set_content(R"({"status":"success"})", "application/json");
+        } else {
+            res.status = 404;
+            res.set_content(R"({"status":"error", "message":"Stream not found"})", "application/json");
+        }
     });
 
     svr.Get("/playlist.m3u8", [&hls_playlist](const httplib::Request&, httplib::Response& res) {
