@@ -28,7 +28,13 @@ void WindowManager::update(int start_p, int end_p) {
             if (p >= 0 && p <= state.last_piece) new_active.insert(p);
         }
         
-        int bg_end = std::min(state.last_piece - 1, end_p + 2000);
+        // --- NEW: Dynamic Background Buffer (150 MB) ---
+        int bg_buffer_bytes = 150 * 1024 * 1024;
+        int bg_pieces_needed = std::max(10, bg_buffer_bytes / state.piece_length);
+        
+        int bg_end = std::min(state.last_piece - 1, end_p + bg_pieces_needed);
+        // -----------------------------------------------
+        
         for (int p = end_p + 1; p <= bg_end; ++p) {
             if (p >= 0 && p <= state.last_piece) new_bg.insert(p);
         }
