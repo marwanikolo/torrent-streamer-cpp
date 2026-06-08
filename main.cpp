@@ -57,7 +57,17 @@ int main(int argc, char* argv[]) {
     pack.set_bool(lt::settings_pack::enable_outgoing_utp, true);
     pack.set_str(lt::settings_pack::dht_bootstrap_nodes, 
         "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881");
-    pack.set_int(lt::settings_pack::connections_limit, 200);
+    
+    // --- FIX 2: THE "SILENT PORT" AND AGGRESSIVE PEERING ---
+    // Opens a listening port for UPnP to map, allowing incoming swarm traffic.
+    pack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881");
+    pack.set_int(lt::settings_pack::connections_limit, 500);
+    pack.set_int(lt::settings_pack::connection_speed, 100); 
+    pack.set_int(lt::settings_pack::torrent_connect_boost, 100);
+    pack.set_int(lt::settings_pack::choking_algorithm, lt::settings_pack::fixed_slots_choker);
+    pack.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_enabled);
+    pack.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_enabled);
+    // -------------------------------------------------------
 
     lt::alert_category_t alert_mask = lt::alert_category::error | lt::alert_category::status | 
                                       lt::alert_category::storage | lt::alert_category::piece_progress;

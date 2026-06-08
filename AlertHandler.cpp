@@ -16,7 +16,6 @@ extern std::atomic<bool> interrupted;
 void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool debug_mode) {
     write_debug_log(debug_mode, "[SYST] Multi-Torrent Alert Loop Thread Started");
     
-    // Timer for our Telemetry Dashboard
     auto last_telemetry_time = std::chrono::steady_clock::now();
 
     while (!interrupted.load()) {
@@ -32,7 +31,6 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
 
                 auto states = manager.get_streams_by_hash(hash);
                 if (!states.empty()) {
-                    // SILENT WAKE-UP: Background HTTP threads are notified instantly.
                     for (auto& state_ptr : states) state_ptr->cv.notify_all(); 
                 }
             }
@@ -59,29 +57,33 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
             }
         }
 
-        // --- TELEMETRY TICKER (Executes every 5 seconds) ---
+        // --- TELEMETRY TICKER ---
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_telemetry_time).count() >= 5) {
             last_telemetry_time = now;
             
-            // Lock the registry to safely read all active streams
             std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
             for (const auto& [hash, state] : manager.active_streams) {
                 if (state->shutting_down.load() || !state->h.is_valid()) continue;
                 
                 lt::torrent_status ts = state->h.status();
-                
-                // Convert bytes/second to MB/second
                 double dl_rate = ts.download_payload_rate / 1048576.0; 
-                float progress = ts.progress * 100.0f;
                 int peers = ts.num_peers;
                 int current_playhead = state->latest_piece_requested.load();
+
+                // --- FIX: ABSOLUTE PHYSICAL FILE PROGRESS ---
+                int have_count = 0;
+                int total_file_pieces = state->last_piece - state->first_piece + 1;
+                for (int p = state->first_piece; p <= state->last_piece; ++p) {
+                    if (state->h.have_piece(lt::piece_index_t(p))) have_count++;
+                }
+                float progress = (static_cast<float>(have_count) / total_file_pieces) * 100.0f;
+                // --------------------------------------------
 
                 // --- 1. FETCH PRIORITIZED WINDOW (The Brain) ---
                 std::vector<int> prioritized_pieces;
                 std::vector<lt::download_priority_t> priorities = state->h.get_piece_priorities();
                 for (int i = 0; i < priorities.size(); ++i) {
-                    // Only log pieces that have a priority > 0 AND haven't been fully downloaded yet
                     if (static_cast<uint8_t>(priorities[i]) > 0 && !state->h.have_piece(lt::piece_index_t(i))) {
                         prioritized_pieces.push_back(i);
                     }
@@ -115,7 +117,6 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
                 flight_str += "]";
                 if (inflight_pieces.empty()) flight_str = "[None]";
 
-                // --- 3. BUILD COMBINED LOG LINE ---
                 std::string log_line = std::format(
                     "[TELE] [{}] DL: {:>5.2f} MB/s | Peers: {:>3} | Prog: {:>5.1f}% | Head: P-{:<5} | Win: {:<40} | Flight: {}",
                     hash.substr(0, 8), dl_rate, peers, progress, current_playhead, win_str, flight_str

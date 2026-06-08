@@ -17,7 +17,6 @@ using json = nlohmann::json;
 extern std::atomic<bool> interrupted;
 extern std::unordered_map<std::string, DirectStreamHandle> active_direct_streams;
 
-// In-memory cache to hold parsed YouTube formats while the user selects one in the UI
 static std::unordered_map<std::string, YtdlpResult> web_yt_cache;
 
 void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::string& hls_playlist, AppConfig& config) {
@@ -25,15 +24,11 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
     
     svr.new_task_queue = [] { return new httplib::ThreadPool(64); };
     
-    // --- 1. MOUNT THE WEB UI DIRECTORY ---
     svr.set_mount_point("/", "./public");
-    
-    // --- 2. ENGINE CONTROL APIs ---
     
     svr.Post("/api/play/torrent", [&manager, &config](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body);
         std::string url = body.value("url", "");
-        // Detach thread so HTTP response returns instantly (metadata fetching can take a few seconds)
         std::thread([&manager, &config, url]() {
             try { handle_torrent(manager, config, url, true); } catch(...) {}
         }).detach();
@@ -103,8 +98,6 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         std::thread([&svr]() { svr.stop(); }).detach();
     });
 
-    // --- 3. STATUS & STOP APIs ---
-    
     svr.Get("/api/status", [&manager, &config](const httplib::Request&, httplib::Response& res) {
         json response = { {"torrents", json::array()}, {"direct_streams", json::array()} };
         {
@@ -146,7 +139,6 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                 state->cv.notify_all(); 
                 stop_player_by_pid(state->player_pid); 
 
-                // --- RESTORED: FASTRESUME LOGIC ---
                 if (state->h.is_valid() && state->h.status().has_metadata) {
                     state->resume_data_saved.store(false);
                     state->h.save_resume_data(lt::torrent_handle::save_info_dict);
@@ -156,7 +148,6 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                         timeout++;
                     }
                 }
-                // ----------------------------------
 
                 manager.ses.remove_torrent(state->h); 
                 manager.active_streams.erase(it_tor);
@@ -167,11 +158,11 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         else res.status = 404;
     });
 
-    // --- 4. PROXY APIs ---
     svr.Get(R"(/abort/([a-fA-F0-9_]+))", [&manager, debug](const httplib::Request& req, httplib::Response& res) {
         std::string hash = req.matches[1];
         if (auto state_ptr = manager.get_stream(hash)) {
             state_ptr->current_request_id++; 
+            state_ptr->cv.notify_all(); 
             res.set_content("Aborted", "text/plain");
         } else res.status = 404;
     });
@@ -181,10 +172,6 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         auto state_ptr = manager.get_stream(hash); 
         if (!state_ptr) { res.status = 404; return; }
 
-        static std::atomic<int> session_counter{0};
-        int my_session_id = ++session_counter;
-        int my_epoch = state_ptr->current_request_id.load(); 
-
         std::string ext = state_ptr->file_path.substr(state_ptr->file_path.find_last_of('.') + 1);
         std::string mime_type = "video/mp4";
         if (ext == "mkv") mime_type = "video/x-matroska";
@@ -192,12 +179,24 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         else if (ext == "m2ts" || ext == "ts") mime_type = "video/mp2t";
         else if (ext == "iso") mime_type = "application/x-iso9660-image";
 
-        res.set_header("Connection", "close");
+        if (req.method == "HEAD") {
+            res.set_header("Accept-Ranges", "bytes");
+            res.set_content_provider(state_ptr->file_size, mime_type, [](size_t, size_t, httplib::DataSink&) { return true; });
+            return;
+        }
+
+        static std::atomic<int> session_counter{0};
+        int my_session_id = ++session_counter;
+        int my_epoch = state_ptr->current_request_id.load(); 
+
         res.set_header("Accept-Ranges", "bytes");
+        
+        // This shared pointer will automatically destroy itself when the lambda returns, safely triggering ~WindowManager()!
         auto wm = std::make_shared<WindowManager>(*state_ptr);
 
         res.set_content_provider(state_ptr->file_size, mime_type,
             [state_ptr, wm, my_session_id, my_epoch, debug](size_t offset, size_t length, httplib::DataSink& sink) {
+                
                 StreamState& state = *state_ptr; 
                 std::int64_t bytes_left = length;
                 std::int64_t current_byte = offset; 
@@ -206,6 +205,8 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
 
                 while (bytes_left > 0) {
                     if (state.shutting_down.load() || interrupted.load()) return false; 
+                    if (my_epoch < state.current_request_id.load()) return false; 
+
                     int current_piece = (state.file_offset + current_byte) / state.piece_length;
                     state.latest_piece_requested = current_piece; 
                     
@@ -218,7 +219,8 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                         std::unique_lock<std::mutex> lk(state.mtx);
                         state.cv.wait_for(lk, std::chrono::milliseconds(200));
                     }
-                    if (state.shutting_down.load() || interrupted.load()) return false;
+                    
+                    if (state.shutting_down.load() || interrupted.load() || my_epoch < state.current_request_id.load()) return false;
                     
                     std::int64_t piece_end_byte = std::min((static_cast<std::int64_t>(current_piece + 1) * state.piece_length) - state.file_offset - 1, state.file_size - 1);
                     std::int64_t chunk_size = std::min({static_cast<std::int64_t>(256 * 1024), static_cast<std::int64_t>(bytes_left), piece_end_byte - current_byte + 1});
@@ -247,4 +249,3 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         );
     });
 }
-

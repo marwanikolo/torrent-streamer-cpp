@@ -16,7 +16,6 @@
 
 extern std::atomic<bool> interrupted;
 
-// Updated signature
 void handle_torrent(TorrentManager& manager, AppConfig& config, std::string source, bool auto_play_largest) {
     interrupted = false;
     lt::add_torrent_params atp;
@@ -51,6 +50,12 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
             atp = resume_params;
             atp.ti = ti_backup;
             atp.save_path = config.save_dir;
+            
+            // --- THE FIX ---
+            // Strip the "paused" flag that gets baked in during daemon shutdown!
+            atp.flags &= ~lt::torrent_flags::paused;
+            atp.flags |= lt::torrent_flags::auto_managed;
+            // ---------------
         }
     }
 
@@ -62,10 +67,6 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
     for (const auto& wss : wss_trackers) {
         atp.trackers.push_back(wss);
     }
-
-    // --- RESTORED: FORCE SEQUENTIAL DOWNLOADING ---
-    atp.flags |= lt::torrent_flags::sequential_download;
-    // ----------------------------------------------
 
     lt::torrent_handle h = manager.ses.add_torrent(atp);
 
@@ -101,7 +102,6 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         std::println(" [{}] {} ({} MB)", i, files.file_path(lt::file_index_t(i)), files.file_size(lt::file_index_t(i)) / (1024 * 1024));
     }
 
-    // --- AUTO-PLAY LOGIC ---
     std::vector<int> selected_indices;
 
     if (auto_play_largest) {
@@ -142,13 +142,22 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         return;
     }
 
-    for (int i = 0; i < files.num_files(); ++i) h.file_priority(lt::file_index_t(i), lt::download_priority_t{0});
+    // 1. Set EVERYTHING to 0 priority initially
+    for (int i = 0; i < files.num_files(); ++i) {
+        h.file_priority(lt::file_index_t(i), lt::download_priority_t{0});
+    }
 
     std::println("\n[+] Torrent Registered Successfully!");
     std::println("  Name: {}", ti->name());
 
     for (int idx : selected_indices) {
-        h.file_priority(lt::file_index_t(idx), lt::download_priority_t{4});
+        // 2. Set the target file to priority 1 to PREVENT writing to hidden .parts files!
+        h.file_priority(lt::file_index_t(idx), lt::download_priority_t{1});
+        
+        // 3. Immediately crush ALL piece priorities to 0 so WindowManager has absolute control
+        for (int p = 0; p < ti->num_pieces(); ++p) {
+            h.piece_priority(lt::piece_index_t(p), lt::dont_download);
+        }
 
         auto state = std::make_shared<StreamState>();
         state->h = h;
@@ -160,21 +169,11 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         state->first_piece = state->file_offset / state->piece_length;
         state->last_piece = (state->file_offset + state->file_size - 1) / state->piece_length;
 
-        // --- THE FIX: CRUSH DEFAULT PIECE PRIORITIES ---
-        // file_priority() just set all pieces in this file to priority 4.
-        // We must zero them out so WindowManager has exclusive control.
-        for (int p = state->first_piece; p <= state->last_piece; ++p) {
-            h.piece_priority(lt::piece_index_t(p), lt::dont_download);
-        }
-        // -----------------------------------------------
-
-        // --- RESTORED: FAST START METADATA FETCHING ---
-        // Instantly demand ONLY the first and last pieces
+        // 4. Fast Start Metadata
         h.piece_priority(lt::piece_index_t(state->first_piece), lt::top_priority);
         h.piece_priority(lt::piece_index_t(state->last_piece), lt::top_priority);
         h.set_piece_deadline(lt::piece_index_t(state->first_piece), 0, lt::torrent_handle::alert_when_available);
         h.set_piece_deadline(lt::piece_index_t(state->last_piece), 0, lt::torrent_handle::alert_when_available);
-        // ----------------------------------------------
 
         std::string stream_id = hash_str + "_" + std::to_string(idx);
         manager.add_stream(stream_id, state);
