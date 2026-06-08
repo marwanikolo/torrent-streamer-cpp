@@ -12,6 +12,7 @@ Recently rewritten into a true multi-threaded background daemon, it features an 
 * **YouTube & DASH Integration:** Features a built-in `yt-dlp` interactive sub-shell. Parses JSON manifests to extract multi-format playlists, allowing you to proxy, cache, and actively merge split video/audio tracks in real-time.
 * **Headless Daemon CLI:** Features a clean, non-blocking interactive prompt (`daemon>`). The primary terminal remains clean, while background server threads process commands instantly.
 * **Lightning-Fast Sequential Streaming:** Built on `libtorrent-rasterbar`, forcing sequential piece downloading and aggressive metadata pre-fetching (Head & Tail pieces) for instant startup.
+* **Thread-Safe Reference Counting:** Safely manages concurrent HTTP connections from aggressive media players (like MPV's internal background caching) without corrupting piece priorities or starving the active stream.
 * **Zero-Latency Active Kill Seeking:** Uses dynamically injected, unique Lua scripts (MPV event hooks and VLC background interfaces) to provide out-of-band signaling. This proactively kills obsolete HTTP worker threads the millisecond you seek, preventing BitTorrent "phantom priority deadlocks."
 * **Universal Direct HTTP Engine:** Paste any standard video URL to proxy, cache, and stream it through the C++ engine. Features dynamic port binding to prevent collision with torrent traffic.
 * **Native ISO & Blu-Ray VFS Mounting:** Automatically detects `.iso` files, routes playback to VLC, and disables BD-J (Java) menus to seamlessly stream 50GB+ physical disk images over BitTorrent using VLC's Virtual File System.
@@ -24,10 +25,10 @@ This engine relies on a strictly decoupled, concurrent architecture that separat
 ### 1. The Central Demultiplexer Registry
 The daemon runs a global `TorrentManager` backed by a `std::shared_mutex` read-write lock. When Libtorrent alerts the system that a piece has finished downloading, the background router inspects the `info_hash`, checks the central registry, and wakes up *only* the specific HTTP threads waiting for that exact torrent file. 
 
-### 2. The Sliding Window Manager
-Video players (`mpv`/`vlc`) send chaotic, rapidly shifting HTTP byte-range requests. If these were passed directly to the swarm, the BitTorrent engine would choke. Instead, requests pass through the **Window Manager**:
-* **Priority Scaling:** Piece priority dynamically scales based on proximity to the playhead using the formula `max(1, 7 - distance)`. The exact piece being watched is set to priority `4` (Highest), while pieces further down the timeline taper off.
-* **Aggressive Deadlines:** To prevent buffering, the manager enforces strict time-to-live deadlines on `libtorrent`. The immediate window is assigned severe `200ms` deadlines, forcing peers to drop non-critical uploads and instantly satisfy the playback buffer.
+### 2. The Sliding Window Manager & Master Session Logic
+Video players (`mpv`/`vlc`) send chaotic, rapidly shifting HTTP byte-range requests, and often keep old sockets alive in the background to pre-cache data. If these were passed directly to the swarm, the BitTorrent engine would choke. 
+* **Thread-Safe Reference Counting:** The Window Manager tracks piece requests across all concurrent player connections. Pieces are only deprioritized when their global reference count hits zero.
+* **Master Session Delegation:** To prevent background caching threads from stealing bandwidth, the daemon dynamically tracks the "Master Session" (the most recent HTTP request). The Master dictates the true playhead, granting it an aggressive `max(2, 7 - distance)` priority cascade and strict `0ms` deadlines, while instantly demoting all background threads to a passive priority.
 
 ## 🛠️ Dependencies
 
@@ -73,7 +74,7 @@ Once the background servers initialize, you will be dropped into the interactive
 * `quit`: Safely kills all active MPV/VLC windows, terminates all network connections, saves global fastresume data, and shuts down the daemon.
 
 ### The Telemetry Dashboard
-Because the daemon UI is kept perfectly clean, you can monitor the real-time background network traffic by opening a second terminal window. The daemon outputs a clean, 5-second telemetry heartbeat showing download/upload speeds, active peers, file progress, and the exact sliding window playhead position.
+Because the daemon UI is kept perfectly clean, you can monitor the real-time background network traffic by opening a second terminal window. The daemon outputs a clean, 5-second telemetry heartbeat showing download/upload speeds, active peers, absolute physical file progress, and the exact sliding window playhead position (sorted natively by priority).
 
 ```bash
 tail -f streamer_debug.log

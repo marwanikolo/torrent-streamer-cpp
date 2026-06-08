@@ -189,10 +189,14 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         int my_session_id = ++session_counter;
         int my_epoch = state_ptr->current_request_id.load(); 
 
+        // --- NEW: Declare this stream as the Master ---
+        state_ptr->latest_session_id.store(my_session_id);
+        // ----------------------------------------------
+
         res.set_header("Accept-Ranges", "bytes");
         
         // This shared pointer will automatically destroy itself when the lambda returns, safely triggering ~WindowManager()!
-        auto wm = std::make_shared<WindowManager>(*state_ptr);
+        auto wm = std::make_shared<WindowManager>(*state_ptr, my_session_id);
 
         res.set_content_provider(state_ptr->file_size, mime_type,
             [state_ptr, wm, my_session_id, my_epoch, debug](size_t offset, size_t length, httplib::DataSink& sink) {
