@@ -22,21 +22,23 @@
 
 using json = nlohmann::json;
 
-extern std::atomic<bool> interrupted;
-extern std::unordered_map<std::string, DirectStreamHandle> active_direct_streams;
-
 static std::unordered_map<std::string, YtdlpResult> web_yt_cache;
 
-// --- UPGRADED: Thread-safe storage for active API JThreads ---
+// Thread-safe storage for active API JThreads
 static std::vector<std::jthread> api_workers;
 static std::mutex worker_mtx;
-// -------------------------------------------------------------
 
-void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::string& hls_playlist, AppConfig& config) {
+void run_http_server(httplib::Server& svr, 
+                     TorrentManager& manager, 
+                     const std::string& hls_playlist, 
+                     AppConfig& config,
+                     std::atomic<bool>& interrupted,
+                     std::unordered_map<std::string, DirectStreamHandle>& active_direct_streams,
+                     std::shared_mutex& direct_mtx) {
+                     
     bool debug = config.debug_mode;
     
     svr.new_task_queue = [] { return new httplib::ThreadPool(64); };
-    
     svr.set_mount_point("/", "./public");
     
     svr.Post("/api/play/torrent", [&manager, &config](const httplib::Request& req, httplib::Response& res) {
@@ -44,7 +46,6 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         std::string url = body.value("url", "");
         write_debug_log(config.debug_mode, "[HTTP] Received API request to play torrent: {}", url);
         
-        // Push the worker to the managed jthread vector instead of detaching
         std::lock_guard<std::mutex> lock(worker_mtx);
         api_workers.emplace_back([&manager, &config, url](std::stop_token stoken) {
             try { 
@@ -59,12 +60,18 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         res.set_content(R"({"status":"success"})", "application/json");
     });
 
-    svr.Post("/api/play/direct", [&config](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/api/play/direct", [&config, &active_direct_streams, &direct_mtx](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body);
         std::string url = body.value("url", "");
         write_debug_log(config.debug_mode, "[HTTP] Received API request to play direct stream: {}", url);
         auto handle = stream_direct_link(config, url);
-        active_direct_streams[handle.stream_id] = handle;
+        
+        // UPGRADED: Thread-safe insertion
+        {
+            std::unique_lock<std::shared_mutex> lock(direct_mtx);
+            active_direct_streams[handle.stream_id] = handle;
+        }
+        
         res.set_content(R"({"status":"success"})", "application/json");
     });
 
@@ -100,7 +107,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         }
     });
 
-    svr.Post("/api/yt/play", [&config](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/api/yt/play", [&config, &active_direct_streams, &direct_mtx](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body);
         std::string url = body.value("url", "");
         int v_idx = body.value("v_idx", -1);
@@ -111,18 +118,23 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
             std::string a_url = (a_idx >= 0) ? yt_res.formats[a_idx].url : "";
             write_debug_log(config.debug_mode, "[HTTP] Proxying YouTube stream: Video [{}] Audio [{}]", v_idx, a_idx);
             auto handle = stream_direct_link(config, yt_res.formats[v_idx].url, yt_res.formats[v_idx].headers, a_url);
-            active_direct_streams[handle.stream_id] = handle;
+            
+            // UPGRADED: Thread-safe insertion
+            {
+                std::unique_lock<std::shared_mutex> lock(direct_mtx);
+                active_direct_streams[handle.stream_id] = handle;
+            }
+            
             res.set_content(R"({"status":"success"})", "application/json");
         } else {
             res.status = 400;
         }
     });
 
-    svr.Post("/api/quit", [&svr](const httplib::Request&, httplib::Response& res) {
+    svr.Post("/api/quit", [&svr, &interrupted](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"status":"success"})", "application/json");
         interrupted = true;
         
-        // Launch a managed jthread that waits briefly for the HTTP response to flush before killing the server
         std::lock_guard<std::mutex> lock(worker_mtx);
         api_workers.emplace_back([&svr](std::stop_token stoken) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -130,7 +142,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         });
     });
 
-    svr.Get("/api/status", [&manager, &config](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/api/status", [&manager, &config, &active_direct_streams, &direct_mtx](const httplib::Request&, httplib::Response& res) {
         json response = { {"torrents", json::array()}, {"direct_streams", json::array()} };
         {
             std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
@@ -142,26 +154,38 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                 });
             }
         }
-        for (const auto& [id, handle] : active_direct_streams) {
-            response["direct_streams"].push_back({ {"id", id}, {"url", handle.stream_id} });
+        
+        // UPGRADED: Thread-safe iteration
+        {
+            std::shared_lock<std::shared_mutex> lock(direct_mtx);
+            for (const auto& [id, handle] : active_direct_streams) {
+                response["direct_streams"].push_back({ {"id", id}, {"url", handle.stream_id} });
+            }
         }
+        
         res.set_content(response.dump(), "application/json");
     });
 
-    svr.Post("/api/stop", [&manager, debug](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/api/stop", [&manager, debug, &active_direct_streams, &direct_mtx](const httplib::Request& req, httplib::Response& res) {
         json req_body;
         try { req_body = json::parse(req.body); } catch (...) { res.status = 400; return; }
         std::string target = req_body.value("id", "");
         bool found = false;
 
-        auto it_dir = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
-                               [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
-        if (it_dir != active_direct_streams.end()) {
-            it_dir->second.cancel_token->store(true);
-            stop_player_by_pid(it_dir->second.player_pid);
-            active_direct_streams.erase(it_dir);
-            found = true;
-        } else {
+        // UPGRADED: Thread-safe search and erase
+        {
+            std::unique_lock<std::shared_mutex> lock(direct_mtx);
+            auto it_dir = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
+                                   [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
+            if (it_dir != active_direct_streams.end()) {
+                it_dir->second.cancel_token->store(true);
+                stop_player_by_pid(it_dir->second.player_pid);
+                active_direct_streams.erase(it_dir);
+                found = true;
+            }
+        }
+
+        if (!found) {
             std::unique_lock<std::shared_mutex> lock(manager.registry_mtx);
             auto it_tor = std::find_if(manager.active_streams.begin(), manager.active_streams.end(),
                                    [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
@@ -200,7 +224,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         } else res.status = 404;
     });
 
-    svr.Get(R"(/stream/([a-fA-F0-9_]+))", [&manager, debug](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(R"(/stream/([a-fA-F0-9_]+))", [&manager, debug, &interrupted](const httplib::Request& req, httplib::Response& res) {
         std::string hash = req.matches[1];
         auto state_ptr = manager.get_stream(hash); 
         if (!state_ptr) { res.status = 404; return; }
@@ -225,11 +249,10 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         state_ptr->latest_session_id.store(my_session_id);
 
         res.set_header("Accept-Ranges", "bytes");
-        
         auto wm = std::make_shared<WindowManager>(*state_ptr, my_session_id);
 
         res.set_content_provider(state_ptr->file_size, mime_type,
-            [state_ptr, wm, my_session_id, my_epoch, debug](size_t offset, size_t length, httplib::DataSink& sink) {
+            [state_ptr, wm, my_session_id, my_epoch, debug, &interrupted](size_t offset, size_t length, httplib::DataSink& sink) {
                 
                 StreamState& state = *state_ptr; 
                 std::int64_t bytes_left = length;
@@ -240,13 +263,9 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                 int start_piece = (state.file_offset + current_byte) / state.piece_length;
                 write_debug_log(debug, "[SEEK] Session {} started reading at byte {} (Piece {})", my_session_id, current_byte, start_piece);
 
-                // ==============================================================================
-                // THE MMAP UPGRADE: Map the file inode directly into Virtual Address Space
-                // ==============================================================================
                 int fd = -1;
                 int retries = 0;
                 
-                // Wait for libtorrent to physically allocate the file on disk (Timeout: 30 seconds)
                 while ((fd = open(state.file_path.c_str(), O_RDONLY)) == -1) {
                     if (state.shutting_down.load() || interrupted.load() || retries > 300) {
                         write_debug_log(debug, "[HTTP] Timeout waiting for file creation: {}", state.file_path);
@@ -256,25 +275,21 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                     retries++;
                 }
 
-                // Map read-only, SHARED (so libtorrent's background writes instantly appear in our mapping)
                 void* mapped_data = mmap(nullptr, state.file_size, PROT_READ, MAP_SHARED, fd, 0);
-                close(fd); // File descriptor can be safely closed immediately after mapping
+                close(fd); 
 
                 if (mapped_data == MAP_FAILED) {
                     write_debug_log(debug, "[HTTP] mmap failed for session {}", my_session_id);
                     return false;
                 }
 
-                // Tell the Linux Kernel we are streaming sequentially to aggressively free old pages from RAM
                 madvise(mapped_data, state.file_size, MADV_SEQUENTIAL);
 
-                // RAII Wrapper: Guarantees munmap() is called when the HTTP thread aborts, preventing memory leaks
                 std::shared_ptr<void> mmap_guard(mapped_data, [size = state.file_size](void* p) {
                     munmap(p, size);
                 });
 
                 const char* file_data = static_cast<const char*>(mapped_data);
-                // ==============================================================================
 
                 while (bytes_left > 0) {
                     if (state.shutting_down.load() || interrupted.load()) return false; 
@@ -286,7 +301,6 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                     int dynamic_window = static_cast<int>((15 * 1024 * 1024) / state.piece_length);
                     wm->update(current_piece, current_piece + std::clamp(dynamic_window, 4, 12)); 
 
-                    // Gatekeeper: Safely block the thread until libtorrent confirms the piece is verified on disk
                     while (!state.h.have_piece(lt::piece_index_t(current_piece))) {
                         if (state.shutting_down.load() || interrupted.load()) return false;
                         if (!sink.is_writable() || my_epoch < state.current_request_id.load()) return false; 
@@ -299,7 +313,6 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                     std::int64_t piece_end_byte = std::min((static_cast<std::int64_t>(current_piece + 1) * state.piece_length) - state.file_offset - 1, state.file_size - 1);
                     std::int64_t chunk_size = std::min({static_cast<std::int64_t>(256 * 1024), static_cast<std::int64_t>(bytes_left), piece_end_byte - current_byte + 1});
 
-                    // ZERO-SYSCALL WRITE: Pass the raw page cache pointer directly to httplib's socket flush.
                     if (!sink.write(file_data + current_byte, chunk_size)) return false;
                     
                     current_byte += chunk_size;

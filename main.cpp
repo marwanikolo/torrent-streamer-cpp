@@ -10,7 +10,7 @@
 #include <httplib.h>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
-#include <boost/asio/ip/tcp.hpp> // <-- ADDED: Required for manual peer endpoints
+#include <boost/asio/ip/tcp.hpp> 
 
 #include "Config.h"
 #include "TorrentEngine.h"
@@ -20,16 +20,19 @@
 #include "ProcessManager.h"
 #include "YtdlpWrapper.h"
 
+// Global signal flag (needed globally ONLY for the OS signal handler)
 std::atomic<bool> interrupted{false};
 void signal_handler(int) { interrupted = true; }
-
-// Global Registry for Active Direct/Web Streams
-std::unordered_map<std::string, DirectStreamHandle> active_direct_streams;
 
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGCHLD, SIG_IGN);
     
+    // --- UPGRADED: State Ownership & Thread Safety ---
+    std::unordered_map<std::string, DirectStreamHandle> active_direct_streams;
+    std::shared_mutex direct_mtx;
+    // -------------------------------------------------
+
     AppConfig config;
     config.save_dir = "/mnt/NewVolume/Tordown";
     if (config.port <= 0) config.port = 8080; 
@@ -59,8 +62,6 @@ int main(int argc, char* argv[]) {
     pack.set_str(lt::settings_pack::dht_bootstrap_nodes, 
         "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881");
     
-    // --- FIX 2: THE "SILENT PORT" AND AGGRESSIVE PEERING ---
-    // Opens a listening port for UPnP to map, allowing incoming swarm traffic.
     pack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881");
     pack.set_int(lt::settings_pack::connections_limit, 500);
     pack.set_int(lt::settings_pack::connection_speed, 100); 
@@ -68,14 +69,11 @@ int main(int argc, char* argv[]) {
     pack.set_int(lt::settings_pack::choking_algorithm, lt::settings_pack::fixed_slots_choker);
     pack.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_enabled);
     pack.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_enabled);
-    // -------------------------------------------------------
 
     lt::alert_category_t alert_mask = lt::alert_category::error | lt::alert_category::status | 
                                       lt::alert_category::storage | lt::alert_category::piece_progress;
                      
     if (config.debug_mode) {
-        // We purposely omit `torrent_log` and `peer_log` here to prevent massive handshake spam.
-        // The telemetry ticker in AlertHandler will handle our clean logging.
         std::println("\n[!] DEBUG MODE ENABLED: Writing verbose trace to 'streamer_debug.log'");
         std::ofstream("streamer_debug.log", std::ios::trunc).close();
     }
@@ -88,7 +86,8 @@ int main(int argc, char* argv[]) {
 
     httplib::Server svr;
     std::thread server_thread([&]() {
-        run_http_server(svr, manager, "", config);
+        // Pass the state by reference (Dependency Injection)
+        run_http_server(svr, manager, "", config, interrupted, active_direct_streams, direct_mtx);
         svr.listen("0.0.0.0", config.port);
     });
 
@@ -99,7 +98,7 @@ int main(int argc, char* argv[]) {
     std::println("  stop <url>              - Stop a specific running stream");
     std::println("  yt                      - Enter interactive yt-dlp sub-shell");
     std::println("  list                    - Show active torrent streams");
-    std::println("  peer <hash> <ip>:<port> - Manually inject a peer into a swarm"); // <-- ADDED THIS
+    std::println("  peer <hash> <ip>:<port> - Manually inject a peer into a swarm");
     std::println("  quit                    - Shut down the daemon gracefully\n");
 
     if (!initial_source.empty()) {
@@ -113,6 +112,7 @@ int main(int argc, char* argv[]) {
         if (!initial_source.empty()) {
             if (initial_source.starts_with("http://") || initial_source.starts_with("https://")) {
                 auto handle = stream_direct_link(config, initial_source); 
+                std::unique_lock<std::shared_mutex> lock(direct_mtx);
                 active_direct_streams[handle.stream_id] = handle;
             } else {
                 try {
@@ -154,6 +154,8 @@ int main(int argc, char* argv[]) {
                 std::println("  => [{}] {}", hash.substr(0, 8), state->file_path);
                 std::println("     URL: http://localhost:{}/stream/{}", config.port, hash);
             }
+            
+            std::shared_lock<std::shared_mutex> d_lock(direct_mtx);
             std::println("\nActive Direct Web Streams: {}", active_direct_streams.size());
             for (const auto& [id, handle] : active_direct_streams) {
                 std::println("  => {}", id);
@@ -164,40 +166,38 @@ int main(int argc, char* argv[]) {
             bool found = false;
 
             // 1. Search Direct Web Streams
-            auto it_dir = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
-                                   [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
-            
-            if (it_dir != active_direct_streams.end()) {
-                it_dir->second.cancel_token->store(true);
-                stop_player_by_pid(it_dir->second.player_pid);
-                std::println("[+] Successfully stopped Direct Stream: {}", it_dir->first);
-                active_direct_streams.erase(it_dir);
-                found = true;
-            } 
+            {
+                std::unique_lock<std::shared_mutex> d_lock(direct_mtx);
+                auto it_dir = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
+                                       [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
+                
+                if (it_dir != active_direct_streams.end()) {
+                    it_dir->second.cancel_token->store(true);
+                    stop_player_by_pid(it_dir->second.player_pid);
+                    std::println("[+] Successfully stopped Direct Stream: {}", it_dir->first);
+                    active_direct_streams.erase(it_dir);
+                    found = true;
+                } 
+            }
+
             // 2. Search BitTorrent Streams
-            else {
+            if (!found) {
                 std::unique_lock<std::shared_mutex> lock(manager.registry_mtx);
                 auto it_tor = std::find_if(manager.active_streams.begin(), manager.active_streams.end(),
                                        [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
                 
                 if (it_tor != manager.active_streams.end()) {
                     auto state = it_tor->second;
-                    
-                    // Safely terminate the HTTP socket threads
                     state->shutting_down.store(true);
                     state->cv.notify_all(); 
-                    
-                    // Kill the MPV/VLC Window
                     stop_player_by_pid(state->player_pid); 
                     
-                    // --- RESTORED: FASTRESUME LOGIC ---
                     if (state->h.is_valid() && state->h.status().has_metadata) {
                         std::print("[*] Saving fastresume data... ");
                         std::fflush(stdout);
                         state->resume_data_saved.store(false);
                         state->h.save_resume_data(lt::torrent_handle::save_info_dict);
                         
-                        // Wait up to 3 seconds for AlertHandler to write the file
                         int timeout = 0;
                         while (!state->resume_data_saved.load() && timeout < 30) {
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -205,11 +205,8 @@ int main(int argc, char* argv[]) {
                         }
                         std::println("Done!");
                     }
-                    // ----------------------------------
                     
-                    // Tell libtorrent to sever swarm connections and remove the torrent
                     manager.ses.remove_torrent(state->h); 
-                    
                     std::println("[+] Successfully stopped Torrent Stream: {}", it_tor->first);
                     manager.active_streams.erase(it_tor);
                     found = true;
@@ -322,6 +319,8 @@ int main(int argc, char* argv[]) {
                                 
                                 AppConfig cfg = config;
                                 auto handle = stream_direct_link(cfg, res.formats[v_idx].url, res.formats[v_idx].headers, a_url);
+                                
+                                std::unique_lock<std::shared_mutex> d_lock(direct_mtx);
                                 active_direct_streams[handle.stream_id] = handle;
                             } else {
                                 std::println("[-] Invalid selection.");
@@ -356,6 +355,7 @@ int main(int argc, char* argv[]) {
 
             if (new_source.starts_with("http://") || new_source.starts_with("https://")) {
                 auto handle = stream_direct_link(config, new_source); 
+                std::unique_lock<std::shared_mutex> d_lock(direct_mtx);
                 active_direct_streams[handle.stream_id] = handle;
             } else {
                 try {
@@ -365,7 +365,6 @@ int main(int argc, char* argv[]) {
                 }
             }
         } 
-        // --- ADDED: MANUAL PEER INJECTION ---
         else if (line.starts_with("peer ")) {
             std::string payload = line.substr(5);
             auto space_pos = payload.find(' ');
@@ -389,7 +388,6 @@ int main(int argc, char* argv[]) {
                             boost::system::error_code ec;
                             auto address = boost::asio::ip::make_address(ip, ec);
                             if (!ec) {
-                                // Inject the peer directly into libtorrent's swarm logic!
                                 it->second->h.connect_peer(lt::tcp::endpoint(address, port));
                                 std::println("[+] Successfully injected peer {}:{} into swarm for {}", ip, port, target_hash);
                             } else {
@@ -408,7 +406,6 @@ int main(int argc, char* argv[]) {
                 std::println("[-] Invalid format. Use: peer <hash> <ip>:<port>");
             }
         }
-        // ------------------------------------
         else {
             std::println("Unknown command. Use 'add <link>', 'stop <url>', 'yt', 'list', 'peer <hash> <ip>:<port>', or 'quit'.");
         }
@@ -416,7 +413,6 @@ int main(int argc, char* argv[]) {
 
     std::println("\n[SYST] Shutting down daemon... waiting for threads to exit.");
     
-    // --- RESTORED: GLOBAL FASTRESUME ON QUIT ---
     manager.ses.pause();
     int outstanding = 0;
     for (auto& [hash, state] : manager.active_streams) {
@@ -444,7 +440,6 @@ int main(int argc, char* argv[]) {
         }
         std::println("Done!");
     }
-    // -------------------------------------------
 
     interrupted = true;
     stop_player();
