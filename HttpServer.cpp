@@ -7,10 +7,16 @@
 #include "YtdlpWrapper.h"
 #include <thread>
 #include <chrono>
-#include <fstream>
 #include <algorithm>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
+
+// --- POSIX Headers for Memory Mapping ---
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+// ----------------------------------------
 
 using json = nlohmann::json;
 
@@ -30,9 +36,17 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         json body = json::parse(req.body);
         std::string url = body.value("url", "");
         write_debug_log(config.debug_mode, "[HTTP] Received API request to play torrent: {}", url);
+        
         std::thread([&manager, &config, url]() {
-            try { handle_torrent(manager, config, url, true); } catch(...) {}
+            try { 
+                handle_torrent(manager, config, url, true); 
+            } catch(const std::exception& e) {
+                write_debug_log(config.debug_mode, "[HTTP] CRITICAL: Torrent stream failed - {}", e.what());
+            } catch(...) {
+                write_debug_log(config.debug_mode, "[HTTP] CRITICAL: Torrent stream failed with unknown error.");
+            }
         }).detach();
+        
         res.set_content(R"({"status":"success"})", "application/json");
     });
 
@@ -206,11 +220,46 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                 std::int64_t bytes_left = length;
                 std::int64_t current_byte = offset; 
                 
+                if (state.file_size <= 0) return false;
+
                 int start_piece = (state.file_offset + current_byte) / state.piece_length;
                 write_debug_log(debug, "[SEEK] Session {} started reading at byte {} (Piece {})", my_session_id, current_byte, start_piece);
+
+                // ==============================================================================
+                // THE MMAP UPGRADE: Map the file inode directly into Virtual Address Space
+                // ==============================================================================
+                int fd = -1;
+                int retries = 0;
                 
-                std::ifstream file;
-                int empty_reads = 0; 
+                // Wait for libtorrent to physically allocate the file on disk (Timeout: 30 seconds)
+                while ((fd = open(state.file_path.c_str(), O_RDONLY)) == -1) {
+                    if (state.shutting_down.load() || interrupted.load() || retries > 300) {
+                        write_debug_log(debug, "[HTTP] Timeout waiting for file creation: {}", state.file_path);
+                        return false;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    retries++;
+                }
+
+                // Map read-only, SHARED (so libtorrent's background writes instantly appear in our mapping)
+                void* mapped_data = mmap(nullptr, state.file_size, PROT_READ, MAP_SHARED, fd, 0);
+                close(fd); // File descriptor can be safely closed immediately after mapping
+
+                if (mapped_data == MAP_FAILED) {
+                    write_debug_log(debug, "[HTTP] mmap failed for session {}", my_session_id);
+                    return false;
+                }
+
+                // Tell the Linux Kernel we are streaming sequentially to aggressively free old pages from RAM
+                madvise(mapped_data, state.file_size, MADV_SEQUENTIAL);
+
+                // RAII Wrapper: Guarantees munmap() is called when the HTTP thread aborts, preventing memory leaks
+                std::shared_ptr<void> mmap_guard(mapped_data, [size = state.file_size](void* p) {
+                    munmap(p, size);
+                });
+
+                const char* file_data = static_cast<const char*>(mapped_data);
+                // ==============================================================================
 
                 while (bytes_left > 0) {
                     if (state.shutting_down.load() || interrupted.load()) return false; 
@@ -222,6 +271,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                     int dynamic_window = static_cast<int>((15 * 1024 * 1024) / state.piece_length);
                     wm->update(current_piece, current_piece + std::clamp(dynamic_window, 4, 12)); 
 
+                    // Gatekeeper: Safely block the thread until libtorrent confirms the piece is verified on disk
                     while (!state.h.have_piece(lt::piece_index_t(current_piece))) {
                         if (state.shutting_down.load() || interrupted.load()) return false;
                         if (!sink.is_writable() || my_epoch < state.current_request_id.load()) return false; 
@@ -234,24 +284,11 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                     std::int64_t piece_end_byte = std::min((static_cast<std::int64_t>(current_piece + 1) * state.piece_length) - state.file_offset - 1, state.file_size - 1);
                     std::int64_t chunk_size = std::min({static_cast<std::int64_t>(256 * 1024), static_cast<std::int64_t>(bytes_left), piece_end_byte - current_byte + 1});
 
-                    if (!file.is_open()) file.open(state.file_path, std::ios::binary);
-                    else file.clear(); 
-
-                    file.seekg(current_byte);
-                    std::vector<char> buffer(chunk_size);
-                    file.read(buffer.data(), chunk_size);
+                    // ZERO-SYSCALL WRITE: Pass the raw page cache pointer directly to httplib's socket flush.
+                    if (!sink.write(file_data + current_byte, chunk_size)) return false;
                     
-                    std::streamsize bytes_read = file.gcount();
-                    if (bytes_read == 0) {
-                        file.close(); empty_reads++; 
-                        if (empty_reads > 100) return false; 
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                        continue; 
-                    }
-                    empty_reads = 0; 
-                    if (!sink.write(buffer.data(), bytes_read)) return false;
-                    current_byte += bytes_read;
-                    bytes_left -= bytes_read;
+                    current_byte += chunk_size;
+                    bytes_left -= chunk_size;
                 }
                 return true; 
             }
