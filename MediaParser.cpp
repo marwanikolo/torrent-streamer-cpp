@@ -1,4 +1,5 @@
 #include "MediaParser.h"
+#include "Utils.h"
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -25,10 +26,14 @@ inline uint64_t read_be64(std::ifstream& f) {
 }
 
 std::vector<MapEntry> parse_clpi_file(const std::string& file_path) {
+    write_debug_log(true, "[BLUR] Parsing CLPI file: {}", file_path);
     std::vector<MapEntry> master_index;
     try {
         std::ifstream f(file_path, std::ios::binary);
-        if (!f) return master_index;
+        if (!f) {
+            write_debug_log(true, "[BLUR] Failed to open CLPI file.");
+            return master_index;
+        }
 
         f.seekg(16);
         uint32_t cpi_start_address = read_be32(f);
@@ -92,13 +97,17 @@ std::vector<MapEntry> parse_clpi_file(const std::string& file_path) {
                 uint64_t exact_pts = ((c.PTS_EP_coarse & ~1) << 19) + (fn.PTS_EP_fine << 9);
                 master_index.push_back({exact_pts, exact_spn * 192});
             }
+            write_debug_log(true, "[BLUR] Successfully parsed {} map entries from CLPI.", master_index.size());
             break; 
         }
-    } catch (...) {}
+    } catch (...) {
+        write_debug_log(true, "[BLUR] Error encountered while parsing CLPI file.");
+    }
     return master_index;
 }
 
 std::string generate_hls(const std::vector<MapEntry>& master_index, int64_t total_m2ts_size, int port) {
+    write_debug_log(true, "[HLS ] Generating dynamic m3u8 playlist...");
     std::ostringstream playlist;
     double max_duration = 0.0;
     std::vector<std::string> segments;
@@ -135,5 +144,6 @@ std::string generate_hls(const std::vector<MapEntry>& master_index, int64_t tota
     }
     playlist << "#EXT-X-ENDLIST\n";
     
+    write_debug_log(true, "[HLS ] Generated playlist with {} segments. Target duration: {}s", segments.size(), target_duration);
     return playlist.str();
 }

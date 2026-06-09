@@ -29,6 +29,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
     svr.Post("/api/play/torrent", [&manager, &config](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body);
         std::string url = body.value("url", "");
+        write_debug_log(config.debug_mode, "[HTTP] Received API request to play torrent: {}", url);
         std::thread([&manager, &config, url]() {
             try { handle_torrent(manager, config, url, true); } catch(...) {}
         }).detach();
@@ -38,6 +39,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
     svr.Post("/api/play/direct", [&config](const httplib::Request& req, httplib::Response& res) {
         json body = json::parse(req.body);
         std::string url = body.value("url", "");
+        write_debug_log(config.debug_mode, "[HTTP] Received API request to play direct stream: {}", url);
         auto handle = stream_direct_link(config, url);
         active_direct_streams[handle.stream_id] = handle;
         res.set_content(R"({"status":"success"})", "application/json");
@@ -84,6 +86,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         if (web_yt_cache.count(url) && v_idx >= 0) {
             auto& yt_res = web_yt_cache[url];
             std::string a_url = (a_idx >= 0) ? yt_res.formats[a_idx].url : "";
+            write_debug_log(config.debug_mode, "[HTTP] Proxying YouTube stream: Video [{}] Audio [{}]", v_idx, a_idx);
             auto handle = stream_direct_link(config, yt_res.formats[v_idx].url, yt_res.formats[v_idx].headers, a_url);
             active_direct_streams[handle.stream_id] = handle;
             res.set_content(R"({"status":"success"})", "application/json");
@@ -163,6 +166,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         if (auto state_ptr = manager.get_stream(hash)) {
             state_ptr->current_request_id++; 
             state_ptr->cv.notify_all(); 
+            write_debug_log(debug, "[HTTP] ABORT endpoint triggered for stream: {}", hash);
             res.set_content("Aborted", "text/plain");
         } else res.status = 404;
     });
@@ -189,13 +193,10 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         int my_session_id = ++session_counter;
         int my_epoch = state_ptr->current_request_id.load(); 
 
-        // --- NEW: Declare this stream as the Master ---
         state_ptr->latest_session_id.store(my_session_id);
-        // ----------------------------------------------
 
         res.set_header("Accept-Ranges", "bytes");
         
-        // This shared pointer will automatically destroy itself when the lambda returns, safely triggering ~WindowManager()!
         auto wm = std::make_shared<WindowManager>(*state_ptr, my_session_id);
 
         res.set_content_provider(state_ptr->file_size, mime_type,
@@ -204,6 +205,10 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
                 StreamState& state = *state_ptr; 
                 std::int64_t bytes_left = length;
                 std::int64_t current_byte = offset; 
+                
+                int start_piece = (state.file_offset + current_byte) / state.piece_length;
+                write_debug_log(debug, "[SEEK] Session {} started reading at byte {} (Piece {})", my_session_id, current_byte, start_piece);
+                
                 std::ifstream file;
                 int empty_reads = 0; 
 

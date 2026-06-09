@@ -51,14 +51,14 @@ void HttpProxyServer::setup_routes() {
     if (debug_) {
         svr_.set_logger([this](const httplib::Request& req, const httplib::Response& res) {
             std::string range = req.has_header("Range") ? req.get_header_value("Range") : "None";
-            write_debug_log(debug_, "[PROXY] {} {} | Range: {} | Status: {}", req.method, req.path, range, res.status);
+            write_debug_log(debug_, "[PROX] {} {} | Range: {} | Status: {}", req.method, req.path, range, res.status);
         });
     }
 
     std::string abort_route = "/abort/" + stream_id_;
     svr_.Get(abort_route, [this](const httplib::Request&, httplib::Response& res) {
         current_request_id_++;
-        write_debug_log(debug_, "[PROXY] ABORT endpoint triggered by Lua hook. Severing old streams.");
+        write_debug_log(debug_, "[PROX] ABORT endpoint triggered by Lua hook. Severing old streams.");
         res.set_content("Aborted", "text/plain");
     });
 

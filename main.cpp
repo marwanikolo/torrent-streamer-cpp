@@ -10,6 +10,7 @@
 #include <httplib.h>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
+#include <boost/asio/ip/tcp.hpp> // <-- ADDED: Required for manual peer endpoints
 
 #include "Config.h"
 #include "TorrentEngine.h"
@@ -94,11 +95,12 @@ int main(int argc, char* argv[]) {
     std::println("\n[SYST] Daemon running successfully.");
     std::println("[SYST] Local HTTP Server listening on port {}", config.port);
     std::println("\nCommands:");
-    std::println("  add <link>   - Add a new magnet, .torrent, or HTTP link");
-    std::println("  stop <url>   - Stop a specific running stream");
-    std::println("  yt           - Enter interactive yt-dlp sub-shell");
-    std::println("  list         - Show active torrent streams");
-    std::println("  quit         - Shut down the daemon gracefully\n");
+    std::println("  add <link>              - Add a new magnet, .torrent, or HTTP link");
+    std::println("  stop <url>              - Stop a specific running stream");
+    std::println("  yt                      - Enter interactive yt-dlp sub-shell");
+    std::println("  list                    - Show active torrent streams");
+    std::println("  peer <hash> <ip>:<port> - Manually inject a peer into a swarm"); // <-- ADDED THIS
+    std::println("  quit                    - Shut down the daemon gracefully\n");
 
     if (!initial_source.empty()) {
         auto ns_start = initial_source.find_first_not_of(" \t\r\n\"'");
@@ -363,8 +365,52 @@ int main(int argc, char* argv[]) {
                 }
             }
         } 
+        // --- ADDED: MANUAL PEER INJECTION ---
+        else if (line.starts_with("peer ")) {
+            std::string payload = line.substr(5);
+            auto space_pos = payload.find(' ');
+            
+            if (space_pos != std::string::npos) {
+                std::string target_hash = payload.substr(0, space_pos);
+                std::string ip_port = payload.substr(space_pos + 1);
+                
+                auto colon_pos = ip_port.find(':');
+                if (colon_pos != std::string::npos) {
+                    std::string ip = ip_port.substr(0, colon_pos);
+                    int port = 0;
+                    try { port = std::stoi(ip_port.substr(colon_pos + 1)); } catch(...) {}
+
+                    if (port > 0 && port <= 65535) {
+                        std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
+                        auto it = std::find_if(manager.active_streams.begin(), manager.active_streams.end(),
+                                               [&target_hash](const auto& pair) { return pair.first.starts_with(target_hash); });
+                        
+                        if (it != manager.active_streams.end()) {
+                            boost::system::error_code ec;
+                            auto address = boost::asio::ip::make_address(ip, ec);
+                            if (!ec) {
+                                // Inject the peer directly into libtorrent's swarm logic!
+                                it->second->h.connect_peer(lt::tcp::endpoint(address, port));
+                                std::println("[+] Successfully injected peer {}:{} into swarm for {}", ip, port, target_hash);
+                            } else {
+                                std::println("[-] Invalid IP address format.");
+                            }
+                        } else {
+                            std::println("[-] Could not find an active stream matching: {}", target_hash);
+                        }
+                    } else {
+                        std::println("[-] Invalid port number.");
+                    }
+                } else {
+                    std::println("[-] Invalid format. Use: peer <hash> <ip>:<port>");
+                }
+            } else {
+                std::println("[-] Invalid format. Use: peer <hash> <ip>:<port>");
+            }
+        }
+        // ------------------------------------
         else {
-            std::println("Unknown command. Use 'add <link>', 'stop <url>', 'yt', 'list', or 'quit'.");
+            std::println("Unknown command. Use 'add <link>', 'stop <url>', 'yt', 'list', 'peer <hash> <ip>:<port>', or 'quit'.");
         }
     }
 

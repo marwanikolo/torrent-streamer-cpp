@@ -29,6 +29,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
     interrupted = false;
     auto cancel_token = std::make_shared<std::atomic<bool>>(false);
     std::println("\n[*] Initializing Direct HTTP Engine...");
+    write_debug_log(config.debug_mode, "[PROX] Initializing Direct HTTP Engine for target URL");
 
     if (next_proxy_port.load() == 0) {
         next_proxy_port.store(config.port + 1);
@@ -36,6 +37,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
 
     // Dynamic Proxy Generator Lambda
     auto setup_proxy = [&](const std::string& target_url, const std::string& prefix) -> ProxyInstance {
+        write_debug_log(config.debug_mode, "[PROX] Spinning up local proxy for {}", prefix);
         size_t protocol_pos = target_url.find("://");
         size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
         size_t path_start = target_url.find('/', host_start);
@@ -52,7 +54,10 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         if (res && (res->status == 200 || res->status == 206) && res->has_header("Content-Length")) {
             file_size = std::stoll(res->get_header_value("Content-Length"));
         } else {
-            if (prefix == "video") std::println("[*] Server blocked HEAD request. Attempting Range GET fallback...");
+            if (prefix == "video") {
+                std::println("[*] Server blocked HEAD request. Attempting Range GET fallback...");
+                write_debug_log(config.debug_mode, "[PROX] Server blocked HEAD request for {}. Attempting Range GET fallback...", prefix);
+            }
             httplib::Headers req_headers = headers; 
             req_headers.emplace("Range", "bytes=0-0");
             
@@ -94,6 +99,8 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
 
         instance.proxy = std::make_shared<HttpProxyServer>(*instance.cache, *instance.downloader, target_url, my_proxy_port, stream_id, config.debug_mode, headers);
         instance.proxy->start();
+
+        write_debug_log(config.debug_mode, "[PROX] Proxy {} ready on port {}. Cache size bounds: {}", prefix, my_proxy_port, file_size);
 
         instance.stream_url = std::format("http://localhost:{}/stream/{}", my_proxy_port, stream_id);
         instance.abort_url = std::format("http://localhost:{}/abort/{}", my_proxy_port, stream_id);

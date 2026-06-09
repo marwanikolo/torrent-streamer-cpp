@@ -63,22 +63,33 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
             last_telemetry_time = now;
             
             std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
+            
+            bool is_first = true;
             for (const auto& [hash, state] : manager.active_streams) {
                 if (state->shutting_down.load() || !state->h.is_valid()) continue;
+                
+                // --- NEW: Visual Formatting ---
+                if (is_first) {
+                    // Drops a blank timestamped line to separate this 5-second tick from previous logs
+                    write_debug_log(debug_mode, ""); 
+                    is_first = false;
+                } else {
+                    // Prints a dashed line to separate different active torrent streams
+                    write_debug_log(debug_mode, "----------------------------------------------------------------------------------");
+                }
+                // ------------------------------
                 
                 lt::torrent_status ts = state->h.status();
                 double dl_rate = ts.download_payload_rate / 1048576.0; 
                 int peers = ts.num_peers;
                 int current_playhead = state->latest_piece_requested.load();
 
-                // --- FIX: ABSOLUTE PHYSICAL FILE PROGRESS ---
                 int have_count = 0;
                 int total_file_pieces = state->last_piece - state->first_piece + 1;
                 for (int p = state->first_piece; p <= state->last_piece; ++p) {
                     if (state->h.have_piece(lt::piece_index_t(p))) have_count++;
                 }
                 float progress = (static_cast<float>(have_count) / total_file_pieces) * 100.0f;
-                // --------------------------------------------
 
                 // --- 1. FETCH PRIORITIZED WINDOW (The Brain) ---
                 std::vector<int> prioritized_pieces;
@@ -89,7 +100,6 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
                     }
                 }
                 
-                // NEW: Sort by Priority (Descending), then by Piece Index (Ascending)
                 std::sort(prioritized_pieces.begin(), prioritized_pieces.end(), [&priorities](int a, int b) {
                     uint8_t prio_a = static_cast<uint8_t>(priorities[a]);
                     uint8_t prio_b = static_cast<uint8_t>(priorities[b]);
@@ -116,7 +126,6 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
                     inflight_pieces.push_back(static_cast<int>(q.piece_index));
                 }
                 
-                // NEW: Sort In-Flight by Priority too!
                 std::sort(inflight_pieces.begin(), inflight_pieces.end(), [&priorities](int a, int b) {
                     uint8_t prio_a = static_cast<uint8_t>(priorities[a]);
                     uint8_t prio_b = static_cast<uint8_t>(priorities[b]);

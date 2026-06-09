@@ -13,9 +13,10 @@ Recently rewritten into a true multi-threaded background daemon, it features an 
 * **Headless Daemon CLI:** Features a clean, non-blocking interactive prompt (`daemon>`). The primary terminal remains clean, while background server threads process commands instantly.
 * **Lightning-Fast Sequential Streaming:** Built on `libtorrent-rasterbar`, forcing sequential piece downloading and aggressive metadata pre-fetching (Head & Tail pieces) for instant startup.
 * **Thread-Safe Reference Counting:** Safely manages concurrent HTTP connections from aggressive media players (like MPV's internal background caching) without corrupting piece priorities or starving the active stream.
+* **Anti-Swarm-Shock (In-Flight Shield):** Rapidly seeking across a video file normally causes standard BitTorrent clients to spam `CANCEL` messages, resulting in massive peer drops. This engine uses a "Soft-Cancel" In-Flight Shield to gracefully demote active pieces to a Priority 1 Scavenger Tier, keeping TCP sockets alive and peers happy while instantly pivoting swarm bandwidth to the new playhead.
 * **Zero-Latency Active Kill Seeking:** Uses dynamically injected, unique Lua scripts (MPV event hooks and VLC background interfaces) to provide out-of-band signaling. This proactively kills obsolete HTTP worker threads the millisecond you seek, preventing BitTorrent "phantom priority deadlocks."
 * **Universal Direct HTTP Engine:** Paste any standard video URL to proxy, cache, and stream it through the C++ engine. Features dynamic port binding to prevent collision with torrent traffic.
-* **Native ISO & Blu-Ray VFS Mounting:** Automatically detects `.iso` files, routes playback to VLC, and disables BD-J (Java) menus to seamlessly stream 50GB+ physical disk images over BitTorrent using VLC's Virtual File System.
+* **Native ISO & Blu-Ray Parsing:** Automatically detects `.iso` files, parses their internal binary `.clpi` (Clip Information) files, maps the physical `SPN` byte offsets, and generates dynamic Apple HLS (`.m3u8`) playlists on the fly. This allows you to stream 50GB+ physical disk images sequentially over BitTorrent without extracting or transcoding the video.
 * **Graceful Shutdown & Fast Start:** Traps `SIGINT` (Ctrl+C) and utilizes a multi-kill TCP deadlock unblocker to instantly terminate all spawned media players and serialize `.fastresume` data to disk for instant re-launches.
 
 ## 🧠 Architecture & Under the Hood
@@ -28,7 +29,7 @@ The daemon runs a global `TorrentManager` backed by a `std::shared_mutex` read-w
 ### 2. The Sliding Window Manager & Master Session Logic
 Video players (`mpv`/`vlc`) send chaotic, rapidly shifting HTTP byte-range requests, and often keep old sockets alive in the background to pre-cache data. If these were passed directly to the swarm, the BitTorrent engine would choke. 
 * **Thread-Safe Reference Counting:** The Window Manager tracks piece requests across all concurrent player connections. Pieces are only deprioritized when their global reference count hits zero.
-* **Master Session Delegation:** To prevent background caching threads from stealing bandwidth, the daemon dynamically tracks the "Master Session" (the most recent HTTP request). The Master dictates the true playhead, granting it an aggressive `max(2, 7 - distance)` priority cascade and strict `0ms` deadlines, while instantly demoting all background threads to a passive priority.
+* **Master Session Delegation:** To prevent background caching threads from stealing bandwidth, the daemon dynamically tracks the "Master Session" (the most recent HTTP request). The Master dictates the true playhead, granting it an aggressive `max(2, 7 - distance)` priority cascade and strict `0ms` deadlines, while instantly demoting all background threads to a passive Priority 1.
 
 ## 🛠️ Dependencies
 
@@ -45,7 +46,7 @@ Video players (`mpv`/`vlc`) send chaotic, rapidly shifting HTTP byte-range reque
 
 ```bash
 # Clone the repository
-git clone [https://github.com/marwanikolo/torrent-streamer-cpp.git](https://github.com/marwanikolo/torrent-streamer-cpp.git)
+git clone https://github.com/marwanikolo/torrent-streamer-cpp.git
 cd torrent-streamer-cpp
 
 # Create build directory
@@ -71,13 +72,25 @@ Once the background servers initialize, you will be dropped into the interactive
 * `yt`: Enters the interactive `yt-dlp` sub-shell. Use `-J` or `--dump-json` to extract format lists and select specific video/audio streams to proxy.
 * `list`: Displays a real-time list of all active BitTorrent and Direct Web streams, showing their file paths and local HTTP proxy URLs.
 * `stop <hash/url>`: Gracefully terminates a specific active stream, kills the associated media player window, and saves `.fastresume` data.
+* `peer <hash> <ip>:<port>`: Manually injects a specific peer (e.g., from a private tracker) directly into the libtorrent swarm via a raw TCP/µTP handshake, bypassing DHT/PEX restrictions.
 * `quit`: Safely kills all active MPV/VLC windows, terminates all network connections, saves global fastresume data, and shuts down the daemon.
 
-### The Telemetry Dashboard
-Because the daemon UI is kept perfectly clean, you can monitor the real-time background network traffic by opening a second terminal window. The daemon outputs a clean, 5-second telemetry heartbeat showing download/upload speeds, active peers, absolute physical file progress, and the exact sliding window playhead position (sorted natively by priority).
+### The Telemetry Dashboard & Module Tagging
+Because the daemon UI is kept perfectly clean, you can monitor the real-time background network traffic by opening a second terminal window. The daemon outputs a highly structured, thread-safe trace to `streamer_debug.log`. 
 
+The engine uses a **Module Tagging System** so you can easily `grep` for specific events:
+* `[TELE]`: The 5-second P2P heartbeat showing DL speeds, connected peers, and the exact sliding window piece cascade (sorted natively by priority).
+* `[SEEK]`: Triggers the exact byte-offset and piece index when a media player drops a connection and requests a timeline jump.
+* `[PROX]` & `[HLS ]`: Traces local proxy initialization, YouTube CDN header spoofing, and dynamic Apple HLS `.m3u8` generation.
+* `[BLUR]`: Traces the bitwise parsing of raw Blu-ray `.clpi` index files.
+
+**Example Usage:**
 ```bash
+# Watch the master timeline
 tail -f streamer_debug.log
+
+# Filter ONLY for player seeks and proxy routing
+grep -E "\[SEEK\]|\[PROX\]" streamer_debug.log
 ```
 
 ### Command Line Arguments
