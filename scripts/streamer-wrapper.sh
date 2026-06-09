@@ -2,23 +2,17 @@
 
 # ==============================================================================
 # C++ Streamer - Terminal File Manager Wrapper
-# 
-# This script allows terminal file managers (like Yazi, Ranger, LF) to interact 
-# with the daemon. If the daemon is running, it silently injects the torrent 
-# via the REST API. If offline, it spawns a new terminal window.
 # ==============================================================================
 
 TORRENT_FILE="$1"
-PORT=9999 # Match this to the port in your Config.h!
+PORT=9999 # Matched to your Config.h!
 
-# Set your preferred terminal emulator and the path to your compiled binary
-# Examples: 
-#   TERMINAL_CMD="alacritty -e"
-#   TERMINAL_CMD="kitty @ launch --type=tab --title 'C++ Streamer' --"
-TERMINAL_CMD="kitty @ launch --type=tab --title 'C++ Streamer' --"
-STREAMER_BIN="./build/streamer" # Change this if your binary is located elsewhere
+# ABSOLUTE paths are strictly required because Yazi executes this from 
+# different working directories depending on where you are browsing!
+PROJECT_DIR="/home/marwan/torrent-streamer-cpp"
+STREAMER_BIN="$PROJECT_DIR/build/streamer"
 
-# Convert to an absolute path
+# Convert target to an absolute path
 ABS_PATH=$(realpath "$TORRENT_FILE")
 API_BASE="http://127.0.0.1:$PORT/api"
 
@@ -42,5 +36,6 @@ if pgrep -x "streamer" > /dev/null; then
     notify-send "C++ Streamer Error" "Daemon is running but API did not respond on Port $PORT."
 else
     # 2. Daemon is completely offline. Spawn it in a new terminal.
-    $TERMINAL_CMD $STREAMER_BIN "$ABS_PATH" &
+    # Writing the command directly here avoids all bash quote-splitting bugs!
+    kitty @ launch --type=tab --title "C++_Streamer" --cwd="$PROJECT_DIR" "$STREAMER_BIN" "$ABS_PATH" &
 fi
