@@ -9,6 +9,8 @@
 #include <chrono>
 #include <algorithm>
 #include <unordered_map>
+#include <vector>
+#include <mutex>
 #include <nlohmann/json.hpp>
 
 // --- POSIX Headers for Memory Mapping ---
@@ -25,6 +27,11 @@ extern std::unordered_map<std::string, DirectStreamHandle> active_direct_streams
 
 static std::unordered_map<std::string, YtdlpResult> web_yt_cache;
 
+// --- UPGRADED: Thread-safe storage for active API JThreads ---
+static std::vector<std::jthread> api_workers;
+static std::mutex worker_mtx;
+// -------------------------------------------------------------
+
 void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::string& hls_playlist, AppConfig& config) {
     bool debug = config.debug_mode;
     
@@ -37,7 +44,9 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
         std::string url = body.value("url", "");
         write_debug_log(config.debug_mode, "[HTTP] Received API request to play torrent: {}", url);
         
-        std::thread([&manager, &config, url]() {
+        // Push the worker to the managed jthread vector instead of detaching
+        std::lock_guard<std::mutex> lock(worker_mtx);
+        api_workers.emplace_back([&manager, &config, url](std::stop_token stoken) {
             try { 
                 handle_torrent(manager, config, url, true); 
             } catch(const std::exception& e) {
@@ -45,7 +54,7 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
             } catch(...) {
                 write_debug_log(config.debug_mode, "[HTTP] CRITICAL: Torrent stream failed with unknown error.");
             }
-        }).detach();
+        });
         
         res.set_content(R"({"status":"success"})", "application/json");
     });
@@ -112,7 +121,13 @@ void run_http_server(httplib::Server& svr, TorrentManager& manager, const std::s
     svr.Post("/api/quit", [&svr](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"status":"success"})", "application/json");
         interrupted = true;
-        std::thread([&svr]() { svr.stop(); }).detach();
+        
+        // Launch a managed jthread that waits briefly for the HTTP response to flush before killing the server
+        std::lock_guard<std::mutex> lock(worker_mtx);
+        api_workers.emplace_back([&svr](std::stop_token stoken) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            svr.stop();
+        });
     });
 
     svr.Get("/api/status", [&manager, &config](const httplib::Request&, httplib::Response& res) {

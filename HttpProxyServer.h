@@ -30,7 +30,7 @@ private:
     httplib::Headers extra_headers_;
     
     httplib::Server svr_;
-    std::thread server_thread_;
+    std::jthread server_thread_;
     std::atomic<bool> is_shutting_down_{false};
     std::atomic<int> current_request_id_{0};
 };

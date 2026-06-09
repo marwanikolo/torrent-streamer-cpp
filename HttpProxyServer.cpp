@@ -3,6 +3,7 @@
 #include <print>
 #include <format>
 #include <algorithm>
+#include <thread>
 
 HttpProxyServer::HttpProxyServer(HttpCacheManager& cache, HttpDownloader& downloader, const std::string& video_url, int port, const std::string& stream_id, bool debug, const httplib::Headers& headers)
     : cache_(cache), downloader_(downloader), video_url_(video_url), port_(port), stream_id_(stream_id), debug_(debug), extra_headers_(headers) {
@@ -27,7 +28,9 @@ HttpProxyServer::~HttpProxyServer() {
 
 void HttpProxyServer::start() {
     svr_.new_task_queue = [] { return new httplib::ThreadPool(64); };
-    server_thread_ = std::thread([this]() {
+    
+    // --- UPGRADED: Assign to std::jthread ---
+    server_thread_ = std::jthread([this](std::stop_token stoken) {
         svr_.listen("0.0.0.0", port_);
     });
 }
@@ -38,13 +41,16 @@ void HttpProxyServer::stop() {
     current_request_id_++; 
     
     svr_.stop();
-    std::thread([this]() {
+    
+    // --- UPGRADED: Temporary jthread unblocker ---
+    // The destructor of this jthread will safely block until the GET request finishes
+    std::jthread unblocker([this]() {
         httplib::Client cli("localhost", port_);
         cli.set_connection_timeout(0, 100000); 
         cli.Get("/"); 
-    }).detach();
-
-    if (server_thread_.joinable()) server_thread_.join();
+    });
+    
+    // We no longer need server_thread_.join() because jthread handles it!
 }
 
 void HttpProxyServer::setup_routes() {
