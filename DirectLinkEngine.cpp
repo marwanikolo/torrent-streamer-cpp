@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cctype>
 #include <atomic>
+#include <filesystem>
+#include <stdexcept>
 
 extern std::atomic<bool> interrupted;
 static std::atomic<int> next_proxy_port{0};
@@ -88,6 +90,24 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         if (safe_name.length() > 50) safe_name = safe_name.substr(safe_name.length() - 50);
         std::string cache_path = config.save_dir + "/" + prefix + "_" + safe_name + ".bin";
 
+        // ======================================================================================
+        // SANITY CHECK: EXACT BYTE MATCH
+        // If a cache file already exists, the remote server MUST report the exact same byte size.
+        // If it is off by even one byte, it is either an error page, an expired token, 
+        // or a completely different video encode. Overwriting would corrupt the stream.
+        // ======================================================================================
+        std::error_code ec;
+        if (std::filesystem::exists(cache_path, ec)) {
+            std::int64_t local_size = std::filesystem::file_size(cache_path, ec);
+            
+            if (!ec && local_size != file_size) {
+                std::println(stderr, "[-] CRITICAL: Size mismatch! Local cache is {} bytes, but remote link is {} bytes.", local_size, file_size);
+                write_debug_log(config.debug_mode, "[PROX] CRITICAL: Size mismatch (Local: {}, Remote: {}). Refusing to corrupt cache!", local_size, file_size);
+                throw std::runtime_error("Size mismatch. The link has expired or points to a different file.");
+            }
+        }
+        // ======================================================================================
+
         ProxyInstance instance;
         instance.cache = std::make_shared<HttpCacheManager>(cache_path, std::max<std::int64_t>(file_size, 1024));
         instance.cache->init();
@@ -107,37 +127,44 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         return instance;
     };
 
-    // Spin up the Primary Proxy (Video)
-    ProxyInstance video_proxy = setup_proxy(url, "video");
-    std::println("  => Video Proxy: {}", video_proxy.stream_url);
+    try {
+        // Spin up the Primary Proxy (Video)
+        ProxyInstance video_proxy = setup_proxy(url, "video");
+        std::println("  => Video Proxy: {}", video_proxy.stream_url);
 
-    // If an audio link was provided, spin up the Secondary Proxy (Audio)
-    ProxyInstance audio_proxy;
-    if (!audio_url.empty()) {
-        std::println("[*] Detected separate audio track. Booting secondary proxy...");
-        audio_proxy = setup_proxy(audio_url, "audio");
-        std::println("  => Audio Proxy: {}", audio_proxy.stream_url);
-    }
-
-    std::println("\n[*] Launching Universal HTTP Stream...");
-    pid_t pid = launch_player(config, video_proxy.stream_url, video_proxy.abort_url, audio_proxy.stream_url);
-
-    // Keep proxies alive until interrupted globally OR cancelled locally via token
-    std::thread([video_proxy, audio_proxy, cancel_token]() {
-        while (!interrupted.load() && !cancel_token->load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // If an audio link was provided, spin up the Secondary Proxy (Audio)
+        ProxyInstance audio_proxy;
+        if (!audio_url.empty()) {
+            std::println("[*] Detected separate audio track. Booting secondary proxy...");
+            audio_proxy = setup_proxy(audio_url, "audio");
+            std::println("  => Audio Proxy: {}", audio_proxy.stream_url);
         }
+
+        std::println("\n[*] Launching Universal HTTP Stream...");
+        pid_t pid = launch_player(config, video_proxy.stream_url, video_proxy.abort_url, audio_proxy.stream_url);
+
+        // Keep proxies alive until interrupted globally OR cancelled locally via token
+        std::thread([video_proxy, audio_proxy, cancel_token]() {
+            while (!interrupted.load() && !cancel_token->load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            
+            video_proxy.proxy->stop();
+            video_proxy.downloader->stop();
+            video_proxy.cache->save_state();
+
+            if (audio_proxy.proxy) {
+                audio_proxy.proxy->stop();
+                audio_proxy.downloader->stop();
+                audio_proxy.cache->save_state();
+            }
+        }).detach();
+
+        return { video_proxy.stream_url, pid, cancel_token };
         
-        video_proxy.proxy->stop();
-        video_proxy.downloader->stop();
-        video_proxy.cache->save_state();
-
-        if (audio_proxy.proxy) {
-            audio_proxy.proxy->stop();
-            audio_proxy.downloader->stop();
-            audio_proxy.cache->save_state();
-        }
-    }).detach();
-
-    return { video_proxy.stream_url, pid, cancel_token };
+    } catch (const std::exception& e) {
+        std::println(stderr, "[-] Direct HTTP Engine Aborted: {}", e.what());
+        // Return a dummy/invalid handle so main.cpp doesn't map a valid stream
+        return { "failed_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()), -1, cancel_token };
+    }
 }
