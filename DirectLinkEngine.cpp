@@ -47,14 +47,26 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         // ====================================================================
         httplib::Headers auth_headers = headers; 
 
-        if (target_url.find("filestore.app") != std::string::npos || target_url.find("k2s.cc") != std::string::npos) {
+        // 1. Check for TezFiles (Direct domain or tagged CDN node)
+        if (target_url.find("tezfiles.com") != std::string::npos || 
+           (target_url.find("filestore.app") != std::string::npos && target_url.find("project%3Atz") != std::string::npos)) {
+            
+            std::println("[*] Detected TezFiles backend for {}. Injecting VIP headers...", prefix);
+            write_debug_log(config.debug_mode, "[PROX] Detected TezFiles storage node. Applying User-Agent and Referer.");
+            
+            auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+            auth_headers.emplace("Referer", "https://tezfiles.com/");
+        }
+        // 2. Check for Keep2Share (Direct domain or fallback CDN node)
+        else if (target_url.find("k2s.cc") != std::string::npos || 
+                 target_url.find("filestore.app") != std::string::npos) {
+            
             std::println("[*] Detected Keep2Share backend for {}. Injecting VIP headers...", prefix);
             write_debug_log(config.debug_mode, "[PROX] Detected k2s storage node. Applying User-Agent and Referer.");
             
             auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
             auth_headers.emplace("Referer", "https://k2s.cc/");
         }
-        // Add more 'else if' blocks here in the future for Mega, Mediafire, etc.
         // ====================================================================
 
         size_t protocol_pos = target_url.find("://");
@@ -186,4 +198,3 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         return { "failed_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()), -1, cancel_token };
     }
 }
-
