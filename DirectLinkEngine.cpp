@@ -40,6 +40,23 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
     // Dynamic Proxy Generator Lambda
     auto setup_proxy = [&](const std::string& target_url, const std::string& prefix) -> ProxyInstance {
         write_debug_log(config.debug_mode, "[PROX] Spinning up local proxy for {}", prefix);
+        
+        // ====================================================================
+        // DYNAMIC DOMAIN HEADER INJECTION
+        // Evaluates every link independently and scales to future platforms
+        // ====================================================================
+        httplib::Headers auth_headers = headers; 
+
+        if (target_url.find("filestore.app") != std::string::npos || target_url.find("k2s.cc") != std::string::npos) {
+            std::println("[*] Detected Keep2Share backend for {}. Injecting VIP headers...", prefix);
+            write_debug_log(config.debug_mode, "[PROX] Detected k2s storage node. Applying User-Agent and Referer.");
+            
+            auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+            auth_headers.emplace("Referer", "https://k2s.cc/");
+        }
+        // Add more 'else if' blocks here in the future for Mega, Mediafire, etc.
+        // ====================================================================
+
         size_t protocol_pos = target_url.find("://");
         size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
         size_t path_start = target_url.find('/', host_start);
@@ -51,7 +68,8 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         cli.set_follow_location(true);
         std::int64_t file_size = 0;
         
-        auto res = cli.Head(path.c_str(), headers);
+        // Apply the dynamic headers to the initial size check
+        auto res = cli.Head(path.c_str(), auth_headers);
 
         if (res && (res->status == 200 || res->status == 206) && res->has_header("Content-Length")) {
             file_size = std::stoll(res->get_header_value("Content-Length"));
@@ -60,7 +78,8 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 std::println("[*] Server blocked HEAD request. Attempting Range GET fallback...");
                 write_debug_log(config.debug_mode, "[PROX] Server blocked HEAD request for {}. Attempting Range GET fallback...", prefix);
             }
-            httplib::Headers req_headers = headers; 
+            // Apply the dynamic headers to the fallback check
+            httplib::Headers req_headers = auth_headers; 
             req_headers.emplace("Range", "bytes=0-0");
             
             auto get_res = cli.Get(path.c_str(), req_headers, [&](const char*, size_t) { return false; });
@@ -92,9 +111,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
 
         // ======================================================================================
         // SANITY CHECK: EXACT BYTE MATCH
-        // If a cache file already exists, the remote server MUST report the exact same byte size.
-        // If it is off by even one byte, it is either an error page, an expired token, 
-        // or a completely different video encode. Overwriting would corrupt the stream.
         // ======================================================================================
         std::error_code ec;
         if (std::filesystem::exists(cache_path, ec)) {
@@ -112,12 +128,14 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         instance.cache = std::make_shared<HttpCacheManager>(cache_path, std::max<std::int64_t>(file_size, 1024));
         instance.cache->init();
 
-        instance.downloader = std::make_shared<HttpDownloader>(*instance.cache, target_url, headers);
+        // Pass the dynamic headers down to the background caching thread
+        instance.downloader = std::make_shared<HttpDownloader>(*instance.cache, target_url, auth_headers);
         instance.downloader->start();
 
         int my_proxy_port = next_proxy_port++;
 
-        instance.proxy = std::make_shared<HttpProxyServer>(*instance.cache, *instance.downloader, target_url, my_proxy_port, stream_id, config.debug_mode, headers);
+        // Pass the dynamic headers to the local web server to handle MPV seeks
+        instance.proxy = std::make_shared<HttpProxyServer>(*instance.cache, *instance.downloader, target_url, my_proxy_port, stream_id, config.debug_mode, auth_headers);
         instance.proxy->start();
 
         write_debug_log(config.debug_mode, "[PROX] Proxy {} ready on port {}. Cache size bounds: {}", prefix, my_proxy_port, file_size);
@@ -168,3 +186,4 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         return { "failed_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()), -1, cancel_token };
     }
 }
+
