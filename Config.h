@@ -9,5 +9,6 @@ struct AppConfig {
     std::string save_dir = ".";
     std::string player_path = "/usr/bin/mpv";
     int port = 9999;
-    bool debug_mode = true; // <-- ADDED THIS
+    bool debug_mode = true;
+    std::string gofile_token = ""; // <-- ADDED: Secure storage for the token
 };

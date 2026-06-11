@@ -69,6 +69,24 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         }
         // ====================================================================
 
+	// 3. Check for Gofile (Requires accountToken cookie and Referer)
+        else if (target_url.find("gofile.io") != std::string::npos) {
+            
+            std::println("[*] Detected Gofile backend for {}. Injecting auth headers...", prefix);
+            write_debug_log(config.debug_mode, "[PROX] Detected Gofile storage node. Applying Cookie, User-Agent, and Referer.");
+            
+            auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+            auth_headers.emplace("Referer", "https://gofile.io/");
+            
+            // --- FIXED: Dynamic Token Injection ---
+            if (!config.gofile_token.empty()) {
+                auth_headers.emplace("Cookie", "accountToken=" + config.gofile_token);
+            } else {
+                std::println(stderr, "[-] Warning: Gofile link detected, but no --gofile-token was provided. The stream will likely be rejected!");
+                write_debug_log(config.debug_mode, "[PROX] Warning: No Gofile token available in AppConfig.");
+            }
+        }
+
         size_t protocol_pos = target_url.find("://");
         size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
         size_t path_start = target_url.find('/', host_start);

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <shared_mutex>
+#include <cstdlib> // <-- ADDED: Required for std::getenv
 #include <httplib.h>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -37,6 +38,11 @@ int main(int argc, char* argv[]) {
     config.save_dir = "/mnt/NewVolume/Tordown";
     if (config.port <= 0) config.port = 8080; 
     
+    // --- NEW: Securely check for an Environment Variable first ---
+    if (const char* env_token = std::getenv("GOFILE_TOKEN")) {
+        config.gofile_token = env_token;
+    }
+
     std::string initial_source = "";
 
     for (int i = 1; i < argc; ++i) {
@@ -45,6 +51,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "-d" && i + 1 < argc) config.save_dir = argv[++i];
         else if (arg == "--player" && i + 1 < argc) config.player_path = argv[++i];
         else if (arg == "--debug" || arg == "-v") config.debug_mode = true;
+        // --- NEW: Allow overriding the token via CLI argument ---
+        else if (arg == "--gofile-token" && i + 1 < argc) config.gofile_token = argv[++i];
         else initial_source = arg;
     }
 
