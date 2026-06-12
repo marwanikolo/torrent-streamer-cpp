@@ -41,15 +41,19 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
     auto setup_proxy = [&](const std::string& target_url, const std::string& prefix) -> ProxyInstance {
         write_debug_log(config.debug_mode, "[PROX] Spinning up local proxy for {}", prefix);
         
-	// ====================================================================
+        // ====================================================================
         // DYNAMIC DOMAIN HEADER INJECTION
         // ====================================================================
         httplib::Headers auth_headers = headers; 
 
+        // 0. Apply Arbitrary CLI Headers (-H) first
+        for (const auto& [key, value] : config.custom_headers) {
+            auth_headers.emplace(key, value);
+        }
+
         bool has_custom_ua = !config.custom_user_agent.empty();
         bool has_custom_ref = !config.custom_referer.empty();
 
-        // 0. Apply global CLI overrides first
         if (has_custom_ua) auth_headers.emplace("User-Agent", config.custom_user_agent);
         if (has_custom_ref) auth_headers.emplace("Referer", config.custom_referer);
 
@@ -60,7 +64,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
             std::println("[*] Detected TezFiles backend for {}. Injecting VIP headers...", prefix);
             write_debug_log(config.debug_mode, "[PROX] Detected TezFiles storage node. Applying User-Agent and Referer.");
             
-            // Only inject default spoofing if the user didn't provide a manual override
             if (!has_custom_ua) auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
             if (!has_custom_ref) auth_headers.emplace("Referer", "https://tezfiles.com/");
         }
@@ -103,7 +106,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         cli.set_follow_location(true);
         std::int64_t file_size = 0;
         
-        // Apply the dynamic headers to the initial size check
         auto res = cli.Head(path.c_str(), auth_headers);
 
         if (res && (res->status == 200 || res->status == 206) && res->has_header("Content-Length")) {
@@ -113,7 +115,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 std::println("[*] Server blocked HEAD request. Attempting Range GET fallback...");
                 write_debug_log(config.debug_mode, "[PROX] Server blocked HEAD request for {}. Attempting Range GET fallback...", prefix);
             }
-            // Apply the dynamic headers to the fallback check
             httplib::Headers req_headers = auth_headers; 
             req_headers.emplace("Range", "bytes=0-0");
             
@@ -163,13 +164,11 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         instance.cache = std::make_shared<HttpCacheManager>(cache_path, std::max<std::int64_t>(file_size, 1024));
         instance.cache->init();
 
-        // Pass the dynamic headers down to the background caching thread
         instance.downloader = std::make_shared<HttpDownloader>(*instance.cache, target_url, auth_headers);
         instance.downloader->start();
 
         int my_proxy_port = next_proxy_port++;
 
-        // Pass the dynamic headers to the local web server to handle MPV seeks
         instance.proxy = std::make_shared<HttpProxyServer>(*instance.cache, *instance.downloader, target_url, my_proxy_port, stream_id, config.debug_mode, auth_headers);
         instance.proxy->start();
 

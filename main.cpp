@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <shared_mutex>
-#include <cstdlib> // <-- ADDED: Required for std::getenv
+#include <cstdlib> 
 #include <httplib.h>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -38,7 +38,6 @@ int main(int argc, char* argv[]) {
     config.save_dir = "/mnt/NewVolume/Tordown";
     if (config.port <= 0) config.port = 8080; 
     
-    // --- NEW: Securely check for an Environment Variable first ---
     if (const char* env_token = std::getenv("GOFILE_TOKEN")) {
         config.gofile_token = env_token;
     }
@@ -52,11 +51,29 @@ int main(int argc, char* argv[]) {
         else if (arg == "--player" && i + 1 < argc) config.player_path = argv[++i];
         else if (arg == "--debug" || arg == "-v") config.debug_mode = true;
         else if (arg == "--gofile-token" && i + 1 < argc) config.gofile_token = argv[++i];
-        
-        // --- NEW: Parse custom headers ---
         else if (arg == "--user-agent" && i + 1 < argc) config.custom_user_agent = argv[++i];
         else if (arg == "--referer" && i + 1 < argc) config.custom_referer = argv[++i];
-        // ---------------------------------
+        
+        // --- NEW: Arbitrary Header Parser (-H or --header) ---
+        else if ((arg == "-H" || arg == "--header") && i + 1 < argc) {
+            std::string header_str = argv[++i];
+            size_t colon_pos = header_str.find(':');
+            
+            if (colon_pos != std::string::npos) {
+                std::string key = header_str.substr(0, colon_pos);
+                std::string value = header_str.substr(colon_pos + 1);
+                
+                // Trim leading spaces from the value (e.g. "Authorization: Bearer..." -> "Bearer...")
+                size_t start = value.find_first_not_of(" \t");
+                if (start != std::string::npos) value = value.substr(start);
+                else value = "";
+                
+                config.custom_headers.push_back({key, value});
+            } else {
+                std::println(stderr, "[-] Warning: Invalid header format '{}'. Expected 'Key: Value'", header_str);
+            }
+        }
+        // -----------------------------------------------------
         
         else initial_source = arg;
     }
@@ -99,7 +116,6 @@ int main(int argc, char* argv[]) {
 
     httplib::Server svr;
     std::thread server_thread([&]() {
-        // Pass the state by reference (Dependency Injection)
         run_http_server(svr, manager, "", config, interrupted, active_direct_streams, direct_mtx);
         svr.listen("0.0.0.0", config.port);
     });
@@ -113,9 +129,12 @@ int main(int argc, char* argv[]) {
     std::println("  list                    - Show active torrent streams");
     std::println("  peer <hash> <ip>:<port> - Manually inject a peer into a swarm");
     std::println("  quit                    - Shut down the daemon gracefully\n");
+    
+    // --- UPDATED HELP MENU ---
     std::println("Launch Flags:");
     std::println("  --user-agent <string>   - Spoof a custom User-Agent for direct HTTP links");
-    std::println("  --referer <url>         - Spoof a custom Referer for direct HTTP links\n");
+    std::println("  --referer <url>         - Spoof a custom Referer for direct HTTP links");
+    std::println("  -H, --header <string>   - Pass arbitrary HTTP headers (e.g. \"Authorization: Bearer...\")\n");
 
     if (!initial_source.empty()) {
         auto ns_start = initial_source.find_first_not_of(" \t\r\n\"'");
@@ -181,7 +200,6 @@ int main(int argc, char* argv[]) {
             std::string target = line.substr(5);
             bool found = false;
 
-            // 1. Search Direct Web Streams
             {
                 std::unique_lock<std::shared_mutex> d_lock(direct_mtx);
                 auto it_dir = std::find_if(active_direct_streams.begin(), active_direct_streams.end(),
@@ -196,7 +214,6 @@ int main(int argc, char* argv[]) {
                 } 
             }
 
-            // 2. Search BitTorrent Streams
             if (!found) {
                 std::unique_lock<std::shared_mutex> lock(manager.registry_mtx);
                 auto it_tor = std::find_if(manager.active_streams.begin(), manager.active_streams.end(),
