@@ -10,5 +10,9 @@ struct AppConfig {
     std::string player_path = "/usr/bin/mpv";
     int port = 9999;
     bool debug_mode = true;
-    std::string gofile_token = ""; // <-- ADDED: Secure storage for the token
+    std::string gofile_token = ""; 
+    
+    // --- ADDED: Global header spoofing ---
+    std::string custom_user_agent = "";
+    std::string custom_referer = "";
 };

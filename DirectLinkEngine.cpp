@@ -41,11 +41,17 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
     auto setup_proxy = [&](const std::string& target_url, const std::string& prefix) -> ProxyInstance {
         write_debug_log(config.debug_mode, "[PROX] Spinning up local proxy for {}", prefix);
         
-        // ====================================================================
+	// ====================================================================
         // DYNAMIC DOMAIN HEADER INJECTION
-        // Evaluates every link independently and scales to future platforms
         // ====================================================================
         httplib::Headers auth_headers = headers; 
+
+        bool has_custom_ua = !config.custom_user_agent.empty();
+        bool has_custom_ref = !config.custom_referer.empty();
+
+        // 0. Apply global CLI overrides first
+        if (has_custom_ua) auth_headers.emplace("User-Agent", config.custom_user_agent);
+        if (has_custom_ref) auth_headers.emplace("Referer", config.custom_referer);
 
         // 1. Check for TezFiles (Direct domain or tagged CDN node)
         if (target_url.find("tezfiles.com") != std::string::npos || 
@@ -54,8 +60,9 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
             std::println("[*] Detected TezFiles backend for {}. Injecting VIP headers...", prefix);
             write_debug_log(config.debug_mode, "[PROX] Detected TezFiles storage node. Applying User-Agent and Referer.");
             
-            auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
-            auth_headers.emplace("Referer", "https://tezfiles.com/");
+            // Only inject default spoofing if the user didn't provide a manual override
+            if (!has_custom_ua) auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+            if (!has_custom_ref) auth_headers.emplace("Referer", "https://tezfiles.com/");
         }
         // 2. Check for Keep2Share (Direct domain or fallback CDN node)
         else if (target_url.find("k2s.cc") != std::string::npos || 
@@ -64,21 +71,18 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
             std::println("[*] Detected Keep2Share backend for {}. Injecting VIP headers...", prefix);
             write_debug_log(config.debug_mode, "[PROX] Detected k2s storage node. Applying User-Agent and Referer.");
             
-            auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
-            auth_headers.emplace("Referer", "https://k2s.cc/");
+            if (!has_custom_ua) auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+            if (!has_custom_ref) auth_headers.emplace("Referer", "https://k2s.cc/");
         }
-        // ====================================================================
-
-	// 3. Check for Gofile (Requires accountToken cookie and Referer)
+        // 3. Check for Gofile (Requires accountToken cookie and Referer)
         else if (target_url.find("gofile.io") != std::string::npos) {
             
             std::println("[*] Detected Gofile backend for {}. Injecting auth headers...", prefix);
             write_debug_log(config.debug_mode, "[PROX] Detected Gofile storage node. Applying Cookie, User-Agent, and Referer.");
             
-            auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
-            auth_headers.emplace("Referer", "https://gofile.io/");
+            if (!has_custom_ua) auth_headers.emplace("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+            if (!has_custom_ref) auth_headers.emplace("Referer", "https://gofile.io/");
             
-            // --- FIXED: Dynamic Token Injection ---
             if (!config.gofile_token.empty()) {
                 auth_headers.emplace("Cookie", "accountToken=" + config.gofile_token);
             } else {
@@ -86,6 +90,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 write_debug_log(config.debug_mode, "[PROX] Warning: No Gofile token available in AppConfig.");
             }
         }
+        // ====================================================================
 
         size_t protocol_pos = target_url.find("://");
         size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;

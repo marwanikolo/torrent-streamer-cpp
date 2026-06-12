@@ -51,8 +51,13 @@ int main(int argc, char* argv[]) {
         else if (arg == "-d" && i + 1 < argc) config.save_dir = argv[++i];
         else if (arg == "--player" && i + 1 < argc) config.player_path = argv[++i];
         else if (arg == "--debug" || arg == "-v") config.debug_mode = true;
-        // --- NEW: Allow overriding the token via CLI argument ---
         else if (arg == "--gofile-token" && i + 1 < argc) config.gofile_token = argv[++i];
+        
+        // --- NEW: Parse custom headers ---
+        else if (arg == "--user-agent" && i + 1 < argc) config.custom_user_agent = argv[++i];
+        else if (arg == "--referer" && i + 1 < argc) config.custom_referer = argv[++i];
+        // ---------------------------------
+        
         else initial_source = arg;
     }
 
@@ -108,6 +113,9 @@ int main(int argc, char* argv[]) {
     std::println("  list                    - Show active torrent streams");
     std::println("  peer <hash> <ip>:<port> - Manually inject a peer into a swarm");
     std::println("  quit                    - Shut down the daemon gracefully\n");
+    std::println("Launch Flags:");
+    std::println("  --user-agent <string>   - Spoof a custom User-Agent for direct HTTP links");
+    std::println("  --referer <url>         - Spoof a custom Referer for direct HTTP links\n");
 
     if (!initial_source.empty()) {
         auto ns_start = initial_source.find_first_not_of(" \t\r\n\"'");
