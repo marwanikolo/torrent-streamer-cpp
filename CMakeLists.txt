@@ -4,20 +4,20 @@ project(TorrentStreamer)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# --- NEW: Fix for CMake 3.30+ FindBoost deprecation warning ---
-# Must go BEFORE LibtorrentRasterbar, since it internally triggers FindBoost
 if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-# Find necessary system libraries
 find_package(LibtorrentRasterbar REQUIRED)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# Define our source files
+# --- ADDED THE 3 NEW ARCHITECTURE FILES ---
 set(SOURCES
     main.cpp 
+    CliParser.cpp
+    StreamerDaemon.cpp
+    InteractiveShell.cpp
     TorrentEngine.cpp 
     WindowManager.cpp
     AlertHandler.cpp
@@ -33,10 +33,8 @@ set(SOURCES
     NetworkSniffer.cpp
 )
 
-# Create the executable
 add_executable(streamer ${SOURCES})
 
-# Link libraries (Using the strict LibtorrentRasterbar namespace)
 target_link_libraries(streamer 
     PRIVATE 
     LibtorrentRasterbar::torrent-rasterbar 
@@ -45,5 +43,4 @@ target_link_libraries(streamer
     Threads::Threads
 )
 
-# Tell cpp-httplib to enable HTTPS and use OpenSSL
 target_compile_definitions(streamer PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)

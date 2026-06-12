@@ -20,4 +20,6 @@ struct AppConfig {
     
     // --- ADDED: Arbitrary Header Storage ---
     std::vector<std::pair<std::string, std::string>> custom_headers;
+
+    std::string initial_source = "";
 };
