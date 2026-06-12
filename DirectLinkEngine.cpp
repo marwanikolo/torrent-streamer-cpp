@@ -29,6 +29,8 @@ struct ProxyInstance {
 DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url, const httplib::Headers& headers, const std::string& audio_url) {
     interrupted = false;
     auto cancel_token = std::make_shared<std::atomic<bool>>(false);
+    auto finished_token = std::make_shared<std::atomic<bool>>(false); // <-- DETERMINISTIC SYNC TOKEN
+
     std::println("\n[*] Initializing Direct HTTP Engine...");
     write_debug_log(config.debug_mode, "[PROX] Initializing Direct HTTP Engine for target URL");
 
@@ -41,12 +43,12 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         
         httplib::Headers auth_headers; 
 
-	// Helper to cleanly set/overwrite a header
+        // Helper to cleanly set/overwrite a header
         auto set_header = [&](const std::string& key, const std::string& value) {
             std::string clean_k = key;
             std::string clean_v = value;
             
-            // FIX: Strip hidden carriage returns (\r) from tshark intercept to prevent Nginx Tarpits!
+            // Strip hidden carriage returns (\r) from tshark intercept to prevent Nginx Tarpits!
             clean_k.erase(std::remove_if(clean_k.begin(), clean_k.end(), [](char c) { return c == '\r' || c == '\n'; }), clean_k.end());
             clean_v.erase(std::remove_if(clean_v.begin(), clean_v.end(), [](char c) { return c == '\r' || c == '\n'; }), clean_v.end());
 
@@ -157,9 +159,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
             }
         }
 
-        // ======================================================================================
-        // FIX: Remove the abort callback. Allow the 1-byte payload to download so we keep headers
-        // ======================================================================================
         if (file_size <= 0) {
             std::println("[*] Attempting Range GET fallback...");
             httplib::Client cli(current_host);
@@ -244,7 +243,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         std::println("\n[*] Launching Universal HTTP Stream...");
         pid_t pid = launch_player(config, video_proxy.stream_url, video_proxy.abort_url, audio_proxy.stream_url);
 
-        std::thread([video_proxy, audio_proxy, cancel_token]() {
+        std::thread([video_proxy, audio_proxy, cancel_token, finished_token]() {
             while (!interrupted.load() && !cancel_token->load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
@@ -258,12 +257,15 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 audio_proxy.downloader->stop();
                 audio_proxy.cache->save_state();
             }
+            
+            // Signal that cache saving is entirely complete
+            finished_token->store(true);
         }).detach();
 
-        return { video_proxy.stream_url, pid, cancel_token };
+        return { video_proxy.stream_url, pid, cancel_token, finished_token };
         
     } catch (const std::exception& e) {
         std::println(stderr, "[-] Direct HTTP Engine Aborted: {}", e.what());
-        return { "failed_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()), -1, cancel_token };
+        return { "failed_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()), -1, cancel_token, finished_token };
     }
 }

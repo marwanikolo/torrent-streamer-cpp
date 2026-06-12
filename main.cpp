@@ -249,7 +249,7 @@ int main(int argc, char* argv[]) {
                 std::println("================================\n");
             }
         }
-	else if (line.starts_with("sniff play ")) {
+        else if (line.starts_with("sniff play ")) {
             std::string indices_str = line.substr(11);
             std::vector<size_t> targets;
             
@@ -323,8 +323,20 @@ int main(int argc, char* argv[]) {
                                        [&target](const auto& pair) { return pair.first.find(target) != std::string::npos; });
                 
                 if (it_dir != active_direct_streams.end()) {
-                    it_dir->second.cancel_token->store(true);
+                    if (it_dir->second.cancel_token) it_dir->second.cancel_token->store(true);
                     stop_player_by_pid(it_dir->second.player_pid);
+                    
+                    std::print("[*] Saving cache state for direct stream... ");
+                    std::fflush(stdout);
+                    int timeout = 0;
+                    
+                    // ACTIVE SPIN-LOCK: Wait until the token flips to true (max 5 seconds safety limit)
+                    while (it_dir->second.finished_token && !it_dir->second.finished_token->load() && timeout < 50) { 
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        timeout++;
+                    }
+                    std::println("Done!");
+
                     std::println("[+] Successfully stopped Direct Stream: {}", it_dir->first);
                     active_direct_streams.erase(it_dir);
                     found = true;
@@ -491,7 +503,7 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-	else if (line.starts_with("add ")) {
+        else if (line.starts_with("add ")) {
             std::string payload = line.substr(4);
             AppConfig temp_config = config; // Inherit global config
             
@@ -588,6 +600,24 @@ int main(int argc, char* argv[]) {
     // Safely shutdown the background sniffer before dropping out
     if (sniffer) {
         sniffer->stop();
+    }
+    
+    // GRACEFUL SYNC: Tell all active proxies to die, then wait for their tokens!
+    {
+        std::unique_lock<std::shared_mutex> d_lock(direct_mtx);
+        for (auto& [id, handle] : active_direct_streams) {
+            if (handle.cancel_token) handle.cancel_token->store(true);
+            stop_player_by_pid(handle.player_pid);
+            
+            std::print("[*] Waiting for {} to save cache... ", id);
+            std::fflush(stdout);
+            int timeout = 0;
+            while (handle.finished_token && !handle.finished_token->load() && timeout < 50) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                timeout++;
+            }
+            std::println("Done!");
+        }
     }
     
     manager.ses.pause();
