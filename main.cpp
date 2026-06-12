@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <shared_mutex>
 #include <cstdlib> 
+#include <ctime>
+#include <vector>
 #include <httplib.h>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -20,16 +22,28 @@
 #include "DirectLinkEngine.h"
 #include "ProcessManager.h"
 #include "YtdlpWrapper.h"
+#include "NetworkSniffer.h" // Added Sniffer
 
 // Global signal flag (needed globally ONLY for the OS signal handler)
 std::atomic<bool> interrupted{false};
 void signal_handler(int) { interrupted = true; }
 
+// --- The Interception Queue ---
+struct InterceptedStream {
+    std::string url;
+    httplib::Headers headers;
+    std::string timestamp;
+};
+
+std::mutex sniff_mtx;
+std::vector<InterceptedStream> intercept_queue;
+// ------------------------------
+
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGCHLD, SIG_IGN);
     
-    // --- UPGRADED: State Ownership & Thread Safety ---
+    // --- State Ownership & Thread Safety ---
     std::unordered_map<std::string, DirectStreamHandle> active_direct_streams;
     std::shared_mutex direct_mtx;
     // -------------------------------------------------
@@ -54,7 +68,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--user-agent" && i + 1 < argc) config.custom_user_agent = argv[++i];
         else if (arg == "--referer" && i + 1 < argc) config.custom_referer = argv[++i];
         
-        // --- NEW: Arbitrary Header Parser (-H or --header) ---
+        // Arbitrary Header Parser (-H or --header)
         else if ((arg == "-H" || arg == "--header") && i + 1 < argc) {
             std::string header_str = argv[++i];
             size_t colon_pos = header_str.find(':');
@@ -63,7 +77,6 @@ int main(int argc, char* argv[]) {
                 std::string key = header_str.substr(0, colon_pos);
                 std::string value = header_str.substr(colon_pos + 1);
                 
-                // Trim leading spaces from the value (e.g. "Authorization: Bearer..." -> "Bearer...")
                 size_t start = value.find_first_not_of(" \t");
                 if (start != std::string::npos) value = value.substr(start);
                 else value = "";
@@ -73,8 +86,6 @@ int main(int argc, char* argv[]) {
                 std::println(stderr, "[-] Warning: Invalid header format '{}'. Expected 'Key: Value'", header_str);
             }
         }
-        // -----------------------------------------------------
-        
         else initial_source = arg;
     }
 
@@ -126,11 +137,14 @@ int main(int argc, char* argv[]) {
     std::println("  add <link>              - Add a new magnet, .torrent, or HTTP link");
     std::println("  stop <url>              - Stop a specific running stream");
     std::println("  yt                      - Enter interactive yt-dlp sub-shell");
+    std::println("  sniff start             - Start network interception queue");
+    std::println("  sniff list              - Show captured media streams");
+    std::println("  sniff play <idx>        - Play an intercepted stream");
+    std::println("  sniff stop / clear      - Stop sniffer / clear queue");
     std::println("  list                    - Show active torrent streams");
     std::println("  peer <hash> <ip>:<port> - Manually inject a peer into a swarm");
     std::println("  quit                    - Shut down the daemon gracefully\n");
     
-    // --- UPDATED HELP MENU ---
     std::println("Launch Flags:");
     std::println("  --user-agent <string>   - Spoof a custom User-Agent for direct HTTP links");
     std::println("  --referer <url>         - Spoof a custom Referer for direct HTTP links");
@@ -159,6 +173,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    std::shared_ptr<NetworkSniffer> sniffer;
+
     while (true) {
         interrupted = false;
         std::cin.clear();
@@ -182,6 +198,107 @@ int main(int argc, char* argv[]) {
         if (line == "quit" || line == "q") {
             break;
         } 
+        
+        // --- NEW: SNIFFER COMMANDS ---
+        else if (line == "sniff start" || line == "sniff") {
+            if (!sniffer) {
+                // Initialize the background packet capture
+                sniffer = std::make_shared<NetworkSniffer>("wlan0", 
+                    [](const std::string& url, const httplib::Headers& headers) {
+                        std::lock_guard<std::mutex> lock(sniff_mtx);
+                        
+                        auto time_t_now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                        char time_buf[20];
+                        std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&time_t_now));
+
+                        intercept_queue.push_back({url, headers, time_buf});
+                        
+                        // Notify the user dynamically without trashing their current prompt line
+                        std::print("\r\033[K"); 
+                        std::println("[SNIFFER] Captured new media stream! (Total in queue: {})", intercept_queue.size());
+                        std::println("          Type 'sniff list' to view or 'sniff play {}' to stream.", intercept_queue.size() - 1);
+                        std::print("daemon> ");
+                        std::fflush(stdout);
+                    }
+                );
+                sniffer->start();
+            } else {
+                std::println("[*] Sniffer is already active in the background.");
+            }
+        }
+        else if (line == "sniff stop") {
+            if (sniffer) {
+                sniffer->stop();
+                sniffer.reset();
+                std::println("[*] Network sniffer deactivated.");
+            } else {
+                std::println("[-] Sniffer is not running.");
+            }
+        }
+        else if (line == "sniff list") {
+            std::lock_guard<std::mutex> lock(sniff_mtx);
+            if (intercept_queue.empty()) {
+                std::println("[*] No streams intercepted yet. Make sure 'sniff start' is running.");
+            } else {
+                std::println("\n=== Intercepted Stream Queue ===");
+                for (size_t i = 0; i < intercept_queue.size(); ++i) {
+                    std::string display_url = intercept_queue[i].url;
+                    if (display_url.length() > 90) display_url = display_url.substr(0, 87) + "...";
+                    std::println(" [{}] [{}] {}", i, intercept_queue[i].timestamp, display_url);
+                }
+                std::println("================================\n");
+            }
+        }
+	else if (line.starts_with("sniff play ")) {
+            std::string indices_str = line.substr(11);
+            std::vector<size_t> targets;
+            
+            // Extract multiple indices separated by commas or spaces
+            std::string current_num;
+            for (char c : indices_str) {
+                if (std::isdigit(c)) {
+                    current_num += c;
+                } else if (!current_num.empty()) {
+                    targets.push_back(std::stoull(current_num));
+                    current_num.clear();
+                }
+            }
+            if (!current_num.empty()) targets.push_back(std::stoull(current_num));
+
+            if (targets.empty()) {
+                std::println("[-] Usage: sniff play <idx1>,<idx2>...");
+                continue;
+            }
+
+            // Launch each requested stream
+            for (size_t idx : targets) {
+                InterceptedStream target;
+                {
+                    std::lock_guard<std::mutex> lock(sniff_mtx);
+                    if (idx >= intercept_queue.size()) {
+                        std::println("[-] Invalid stream index: {}", idx);
+                        continue;
+                    }
+                    target = intercept_queue[idx];
+                }
+                
+                std::println("\n[*] Launching intercepted stream [{}]...", idx);
+                auto handle = stream_direct_link(config, target.url, target.headers, "");
+                
+                std::unique_lock<std::shared_mutex> d_lock(direct_mtx);
+                active_direct_streams[handle.stream_id] = handle;
+                
+                // Add a half-second delay so multiple MPV instances don't trample each other's audio
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+        else if (line == "sniff clear") {
+            std::lock_guard<std::mutex> lock(sniff_mtx);
+            intercept_queue.clear();
+            std::println("[*] Intercept queue cleared.");
+        }
+        // -----------------------------
+        
         else if (line == "list") {
             std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
             std::println("\nActive Torrent Streams: {}", manager.active_streams.size());
@@ -374,30 +491,52 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-        else if (line.starts_with("add ")) {
-            std::string new_source = line.substr(4);
+	else if (line.starts_with("add ")) {
+            std::string payload = line.substr(4);
+            AppConfig temp_config = config; // Inherit global config
             
-            auto ns_start = new_source.find_first_not_of(" \t\r\n\"'");
+            // Helper to extract inline flags dynamically
+            auto extract_flag = [&](const std::string& flag, std::string& out) {
+                size_t pos = payload.find(flag);
+                if (pos != std::string::npos) {
+                    size_t val_start = payload.find_first_not_of(" \t=\"'", pos + flag.length());
+                    if (val_start != std::string::npos) {
+                        size_t val_end = payload.find_first_of(" \"'", val_start);
+                        if (val_end == std::string::npos) val_end = payload.length();
+                        out = payload.substr(val_start, val_end - val_start);
+                        // Erase the flag and its value from the payload so we are left with just the URL
+                        payload.erase(pos, val_end - pos);
+                    }
+                }
+            };
+
+            // Parse inline flags dynamically
+            extract_flag("--gofile-token", temp_config.gofile_token);
+            extract_flag("--user-agent", temp_config.custom_user_agent);
+            extract_flag("--referer", temp_config.custom_referer);
+
+            std::string target_url = payload;
+            auto ns_start = target_url.find_first_not_of(" \t\r\n\"'");
             if (ns_start != std::string::npos) {
-                new_source = new_source.substr(ns_start, new_source.find_last_not_of(" \t\r\n\"'") - ns_start + 1);
+                target_url = target_url.substr(ns_start, target_url.find_last_not_of(" \t\r\n\"'") - ns_start + 1);
             } else {
-                new_source = "";
+                target_url = "";
             }
 
-            if (new_source.empty()) continue;
+            if (target_url.empty()) continue;
 
-            if (new_source.starts_with("http://") || new_source.starts_with("https://")) {
-                auto handle = stream_direct_link(config, new_source); 
+            if (target_url.starts_with("http://") || target_url.starts_with("https://")) {
+                auto handle = stream_direct_link(temp_config, target_url); 
                 std::unique_lock<std::shared_mutex> d_lock(direct_mtx);
                 active_direct_streams[handle.stream_id] = handle;
             } else {
                 try {
-                    handle_torrent(manager, config, new_source);
+                    handle_torrent(manager, temp_config, target_url);
                 } catch (const std::exception& e) {
                     std::println(stderr, "[-] Failed to parse torrent/magnet: {}", e.what());
                 }
             }
-        } 
+        }
         else if (line.starts_with("peer ")) {
             std::string payload = line.substr(5);
             auto space_pos = payload.find(' ');
@@ -440,11 +579,16 @@ int main(int argc, char* argv[]) {
             }
         }
         else {
-            std::println("Unknown command. Use 'add <link>', 'stop <url>', 'yt', 'list', 'peer <hash> <ip>:<port>', or 'quit'.");
+            std::println("Unknown command. Use 'add <link>', 'stop <url>', 'yt', 'list', 'peer <hash> <ip>:<port>', 'sniff start', or 'quit'.");
         }
     }
 
     std::println("\n[SYST] Shutting down daemon... waiting for threads to exit.");
+    
+    // Safely shutdown the background sniffer before dropping out
+    if (sniffer) {
+        sniffer->stop();
+    }
     
     manager.ses.pause();
     int outstanding = 0;

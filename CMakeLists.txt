@@ -30,6 +30,7 @@ set(SOURCES
     HttpProxyServer.cpp
     DirectLinkEngine.cpp
     YtdlpWrapper.cpp
+    NetworkSniffer.cpp
 )
 
 # Create the executable
