@@ -4,13 +4,13 @@
 #include <vector>
 #include <cstdlib>
 #include <string_view>
+#include <mutex>
+#include <filesystem>
 
 NetworkSniffer::NetworkSniffer(const std::string& interface_name, SniffCallback callback)
     : interface_(interface_name), callback_(std::move(callback)) {}
 
-NetworkSniffer::~NetworkSniffer() {
-    stop();
-}
+NetworkSniffer::~NetworkSniffer() { stop(); }
 
 void NetworkSniffer::start() {
     if (active_.load()) return;
@@ -29,12 +29,8 @@ void NetworkSniffer::stop() {
 }
 
 std::string NetworkSniffer::get_keylog_path() {
-    if (const char* env_path = std::getenv("SSLKEYLOGFILE")) {
-        return std::string(env_path);
-    }
-    if (const char* home = std::getenv("HOME")) {
-        return std::string(home) + "/chrome_tls_keys.log";
-    }
+    if (const char* env_path = std::getenv("SSLKEYLOGFILE")) return std::string(env_path);
+    if (const char* home = std::getenv("HOME")) return std::string(home) + "/chrome_tls_keys.log";
     return "";
 }
 
@@ -44,7 +40,7 @@ static std::vector<std::string_view> split_view(std::string_view str, char delim
     while (start <= str.length()) {
         size_t end = str.find(delim, start);
         if (end == std::string_view::npos) {
-            result.push_back(str.substr(start));
+            if (start < str.length()) result.push_back(str.substr(start));
             break;
         }
         result.push_back(str.substr(start, end - start));
@@ -60,156 +56,73 @@ void NetworkSniffer::worker_loop() {
         return;
     }
 
-    // =========================================================================================
-    // THE UNIVERSAL CDN FILTER
-    // We define all known routing patterns here. The C++ engine will automatically compile 
-    // this into a bulletproof tshark string.
-    // =========================================================================================
-    std::vector<std::string> keywords = {
-        "videoplayback", ".mp4", ".mkv", ".m3u8", ".webm", 
-        "temp_url_", "/api/file/", "/get_file/", "/download/", "/video/", "/file/", "/stream/"
-    };
-
-    std::string filter;
-    for (size_t i = 0; i < keywords.size(); ++i) {
-        filter += "(http2.header.value contains \"" + keywords[i] + "\" || ";
-        filter += "http3.headers.header.value contains \"" + keywords[i] + "\" || ";
-        filter += "http.request.uri contains \"" + keywords[i] + "\")";
-        if (i < keywords.size() - 1) filter += " || ";
+    if (!std::filesystem::exists("scripts/daemon_sniffer.lua")) {
+        std::println(stderr, "[-] Sniffer failed: Could not find scripts/daemon_sniffer.lua");
+        return;
     }
 
+    // -q suppresses all normal tshark output. -X lua_script attaches our engine.
     std::string cmd = std::format(
-        "tshark -l -i {} -o \"tls.keylog_file:{}\" -Y '{}' -T fields "
-        "-e _ws.col.Protocol -e http2.header.name -e http2.header.value "
-        "-e http3.header.header.name -e http3.headers.header.value "
-        "-e http.request.method -e http.host -e http.request.uri -e http.cookie -e http.user_agent -e http.referer "
-        "-E separator='|' -E aggregator='^' 2>/dev/null", 
-        interface_, keylog, filter
+        "tshark -q -l -i {} -o \"tls.keylog_file:{}\" -X lua_script:scripts/daemon_sniffer.lua 2>/dev/null", 
+        interface_, keylog
     );
 
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) return;
 
-    std::string line;
-    line.reserve(8192); 
-    char buffer[4096];
+    char buffer[8192];
+    const std::string_view hook_prefix = "[DAEMON_HOOK] ";
     
     while (active_.load() && fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        line += buffer;
-        if (line.empty() || line.back() != '\n') {
-            continue; 
-        }
-
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-            line.pop_back();
-        }
-
-        auto columns = split_view(line, '|');
-        if (columns.size() < 11) {
-            line.clear();
-            continue; 
-        }
-
-        std::string_view h2_names = columns[1];
-        std::string_view h2_vals  = columns[2];
-        std::string_view h3_names = columns[3];
-        std::string_view h3_vals  = columns[4];
-        std::string_view h1_method= columns[5];
-        std::string_view h1_host  = columns[6];
-        std::string_view h1_uri   = columns[7];
-        std::string_view h1_cookie= columns[8];
-        std::string_view h1_ua    = columns[9];
-        std::string_view h1_referer= columns[10];
-
-        std::string authority, path, method;
-        httplib::Headers captured_headers;
-
-        // Route A: Modern HTTP/2 and HTTP/3 Parsing
-        if (!h2_names.empty() || !h3_names.empty()) {
-            std::string_view names = !h2_names.empty() ? h2_names : h3_names;
-            std::string_view vals  = !h2_names.empty() ? h2_vals : h3_vals;
-
-            if (!names.empty() && !vals.empty()) {
-                auto name_arr = split_view(names, '^');
-                auto val_arr = split_view(vals, '^');
-
-                size_t count = std::min(name_arr.size(), val_arr.size());
-                for (size_t i = 0; i < count; ++i) {
-                    if (name_arr[i] == ":authority") authority = std::string(val_arr[i]);
-                    else if (name_arr[i] == ":path") path = std::string(val_arr[i]);
-                    else if (name_arr[i] == ":method") method = std::string(val_arr[i]);
-                    else if (name_arr[i].starts_with(":")) continue;
-                    else if (name_arr[i] == "accept-encoding") continue;
-                    else captured_headers.emplace(std::string(name_arr[i]), std::string(val_arr[i]));
-                }
-            }
-        } 
-        // Route B: Legacy HTTP/1.1 Parsing
-        else if (!h1_method.empty()) {
-            method = std::string(h1_method);
-            authority = std::string(h1_host);
-            path = std::string(h1_uri);
-            
-            auto add_h1_headers = [&](const std::string& key, std::string_view val_str) {
-                if (val_str.empty()) return;
-                auto vals = split_view(val_str, '^');
-                for (auto v : vals) {
-                    captured_headers.emplace(key, std::string(v));
-                }
-            };
-            
-            add_h1_headers("cookie", h1_cookie);
-            add_h1_headers("user-agent", h1_ua);
-            add_h1_headers("referer", h1_referer);
-        }
-
-        line.clear(); 
-
-        if (authority.empty() || path.empty()) continue;
-        if (method.find("GET") == std::string::npos) continue;
-
-        // =========================================================================================
-        // STRICT MEDIA SANITY CHECK (Now dynamic against the Universal Keyword array)
-        // =========================================================================================
-        bool is_media = false;
-        for (const auto& kw : keywords) {
-            if (path.find(kw) != std::string::npos) {
-                is_media = true;
-                break;
-            }
-        }
-        if (!is_media) continue;
-
-        std::string full_url = "https://" + authority + path;
+        std::string_view line(buffer);
         
-        std::string dup_key;
-        if (path.find("videoplayback") != std::string::npos) {
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+            line.remove_suffix(1);
+        }
+
+        if (!line.starts_with(hook_prefix)) continue; 
+        
+        line.remove_prefix(hook_prefix.length());
+
+        size_t delim_pos = line.find('|');
+        if (delim_pos == std::string_view::npos) continue;
+
+        std::string full_url(line.substr(0, delim_pos));
+        std::string_view header_chunk = line.substr(delim_pos + 1);
+
+        // Deduplication Logic
+        std::string dup_key = full_url;
+        if (full_url.find("videoplayback") != std::string::npos) {
             size_t id_pos = full_url.find("id=");
             if (id_pos != std::string::npos) {
                 size_t id_end = full_url.find('&', id_pos);
-                dup_key = authority + path + "?" + full_url.substr(id_pos, id_end - id_pos);
-            } else {
-                dup_key = authority + path; 
+                dup_key = full_url.substr(0, full_url.find('?')) + "?" + full_url.substr(id_pos, id_end - id_pos);
             }
-        } else {
-            dup_key = full_url;
         }
 
         bool is_new = false;
         {
             std::lock_guard<std::mutex> lock(history_mtx_);
-            
-            if (seen_streams_.size() > 1000) {
-                seen_streams_.clear();
-            }
-
-            if (seen_streams_.find(dup_key) == seen_streams_.end()) {
-                seen_streams_.insert(dup_key);
+            if (seen_streams_.size() > 1000) seen_streams_.clear();
+            if (seen_streams_.insert(dup_key).second) {
                 is_new = true;
             }
         }
 
         if (is_new && callback_) {
+            httplib::Headers captured_headers;
+            
+            auto header_pairs = split_view(header_chunk, '^');
+            for (auto pair : header_pairs) {
+                size_t eq_pos = pair.find('=');
+                if (eq_pos != std::string_view::npos) {
+                    captured_headers.emplace(
+                        std::string(pair.substr(0, eq_pos)),
+                        std::string(pair.substr(eq_pos + 1))
+                    );
+                }
+            }
+
             callback_(full_url, captured_headers);
         }
     }

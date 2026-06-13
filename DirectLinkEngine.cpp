@@ -43,7 +43,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         
         httplib::Headers auth_headers; 
 
-        // Helper to cleanly set/overwrite a header
+        // Helper to cleanly set/overwrite a header (Highly Optimized)
         auto set_header = [&](const std::string& key, const std::string& value) {
             std::string clean_k = key;
             std::string clean_v = value;
@@ -52,14 +52,20 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
             clean_k.erase(std::remove_if(clean_k.begin(), clean_k.end(), [](char c) { return c == '\r' || c == '\n'; }), clean_k.end());
             clean_v.erase(std::remove_if(clean_v.begin(), clean_v.end(), [](char c) { return c == '\r' || c == '\n'; }), clean_v.end());
 
+            // OPTIMIZATION: Lowercase the target key ONCE outside the loop
+            std::string target_lower = clean_k;
+            std::transform(target_lower.begin(), target_lower.end(), target_lower.begin(), ::tolower);
+
             for (auto it = auth_headers.begin(); it != auth_headers.end(); ) {
-                std::string k_lower = it->first;
-                std::transform(k_lower.begin(), k_lower.end(), k_lower.begin(), ::tolower);
-                std::string t_lower = clean_k;
-                std::transform(t_lower.begin(), t_lower.end(), t_lower.begin(), ::tolower);
+                std::string current_lower = it->first;
+                std::transform(current_lower.begin(), current_lower.end(), current_lower.begin(), ::tolower);
                 
-                if (k_lower == t_lower) it = auth_headers.erase(it);
-                else ++it;
+                // Safe iterator progression without duplicate key errors
+                if (current_lower == target_lower) {
+                    it = auth_headers.erase(it); 
+                } else {
+                    ++it;
+                }
             }
             auth_headers.emplace(clean_k, clean_v);
         };

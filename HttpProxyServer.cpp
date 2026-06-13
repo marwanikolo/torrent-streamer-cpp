@@ -115,19 +115,38 @@ void HttpProxyServer::setup_routes() {
                     req_headers.emplace("Range", std::format("bytes={}-{}", current_byte, req_end));
                     
                     bool abort_proxy = false;
-                    auto web_res = cli.Get(path_.c_str(), req_headers, [&](const char *data, size_t data_length) {
-                        if (is_shutting_down_ || my_id < current_request_id_) {
-                            abort_proxy = true;
-                            return false; 
+                    
+                    // =========================================================================
+                    // UPGRADED: Two-stage HTTP GET (Status Check -> Content Stream)
+                    // =========================================================================
+                    auto web_res = cli.Get(path_.c_str(), req_headers, 
+                        
+                        // 1. RESPONSE HANDLER: Bouncer checks the status code first
+                        [&](const httplib::Response& response) {
+                            if (response.status != 200 && response.status != 206) {
+                                write_debug_log(debug_, "[PROX] CRITICAL: CDN returned HTTP {}. Aborting stream to prevent cache poisoning.", response.status);
+                                std::println(stderr, "[-] Proxy Error: CDN returned HTTP {} (Link expired or IP rate-limited)", response.status);
+                                abort_proxy = true;
+                                return false; // Aborts connection immediately!
+                            }
+                            return true;
+                        },
+                        
+                        // 2. CONTENT RECEIVER: Only runs if the status is 200/206
+                        [&](const char *data, size_t data_length) {
+                            if (is_shutting_down_ || my_id < current_request_id_) {
+                                abort_proxy = true;
+                                return false; 
+                            }
+                            sink.write(data, data_length);
+                            cache_.write_data(current_byte, data, data_length);
+                            current_byte += data_length;
+                            bytes_left -= data_length;
+                            return true;
                         }
-                        sink.write(data, data_length);
-                        cache_.write_data(current_byte, data, data_length);
-                        current_byte += data_length;
-                        bytes_left -= data_length;
-                        return true;
-                    });
+                    );
 
-                    if (abort_proxy) return false;
+                    if (abort_proxy || !web_res) return false;
                     if (current_byte > chunk_end) cache_.set_chunk(chunk_idx);
                 }
                 return true; 
