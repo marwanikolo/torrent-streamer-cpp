@@ -38,8 +38,6 @@ std::string NetworkSniffer::get_keylog_path() {
     return "";
 }
 
-// FIXED: Changed 'start < str.length()' to 'start <= str.length()'
-// This guarantees that trailing empty fields (like an empty Referer) are captured!
 static std::vector<std::string_view> split_view(std::string_view str, char delim) {
     std::vector<std::string_view> result;
     size_t start = 0;
@@ -62,9 +60,23 @@ void NetworkSniffer::worker_loop() {
         return;
     }
 
-    std::string filter = "(http2.header.value contains \"videoplayback\" || http2.header.value contains \".mp4\" || http2.header.value contains \".mkv\" || http2.header.value contains \".m3u8\" || http2.header.value contains \".webm\" || http2.header.value contains \"temp_url_sig\") || "
-                         "(http3.headers.header.value contains \"videoplayback\" || http3.headers.header.value contains \".mp4\" || http3.headers.header.value contains \".m3u8\" || http3.headers.header.value contains \".webm\" || http3.headers.header.value contains \"temp_url_sig\") || "
-                         "(http.request.uri contains \"videoplayback\" || http.request.uri contains \".mp4\" || http.request.uri contains \".mkv\" || http.request.uri contains \".m3u8\" || http.request.uri contains \".webm\" || http.request.uri contains \"temp_url_sig\")";
+    // =========================================================================================
+    // THE UNIVERSAL CDN FILTER
+    // We define all known routing patterns here. The C++ engine will automatically compile 
+    // this into a bulletproof tshark string.
+    // =========================================================================================
+    std::vector<std::string> keywords = {
+        "videoplayback", ".mp4", ".mkv", ".m3u8", ".webm", 
+        "temp_url_", "/api/file/", "/get_file/", "/download/", "/video/", "/file/", "/stream/"
+    };
+
+    std::string filter;
+    for (size_t i = 0; i < keywords.size(); ++i) {
+        filter += "(http2.header.value contains \"" + keywords[i] + "\" || ";
+        filter += "http3.headers.header.value contains \"" + keywords[i] + "\" || ";
+        filter += "http.request.uri contains \"" + keywords[i] + "\")";
+        if (i < keywords.size() - 1) filter += " || ";
+    }
 
     std::string cmd = std::format(
         "tshark -l -i {} -o \"tls.keylog_file:{}\" -Y '{}' -T fields "
@@ -98,7 +110,6 @@ void NetworkSniffer::worker_loop() {
             continue; 
         }
 
-        // We ignore columns[0] (_ws.col.Protocol) entirely now. It is too brittle.
         std::string_view h2_names = columns[1];
         std::string_view h2_vals  = columns[2];
         std::string_view h3_names = columns[3];
@@ -114,7 +125,6 @@ void NetworkSniffer::worker_loop() {
         httplib::Headers captured_headers;
 
         // Route A: Modern HTTP/2 and HTTP/3 Parsing
-        // FIXED: We now rely purely on the PRESENCE of HTTP2/3 headers, which is 100% accurate.
         if (!h2_names.empty() || !h3_names.empty()) {
             std::string_view names = !h2_names.empty() ? h2_names : h3_names;
             std::string_view vals  = !h2_names.empty() ? h2_vals : h3_vals;
@@ -158,13 +168,16 @@ void NetworkSniffer::worker_loop() {
         if (authority.empty() || path.empty()) continue;
         if (method.find("GET") == std::string::npos) continue;
 
-        bool is_media = path.find("videoplayback") != std::string::npos ||
-                        path.find(".mp4") != std::string::npos ||
-                        path.find(".mkv") != std::string::npos ||
-                        path.find(".webm") != std::string::npos ||
-                        path.find(".m3u8") != std::string::npos ||
-                        path.find("temp_url_sig") != std::string::npos;
-        
+        // =========================================================================================
+        // STRICT MEDIA SANITY CHECK (Now dynamic against the Universal Keyword array)
+        // =========================================================================================
+        bool is_media = false;
+        for (const auto& kw : keywords) {
+            if (path.find(kw) != std::string::npos) {
+                is_media = true;
+                break;
+            }
+        }
         if (!is_media) continue;
 
         std::string full_url = "https://" + authority + path;
