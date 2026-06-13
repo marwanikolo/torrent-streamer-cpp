@@ -6,6 +6,7 @@
 #include <iostream>
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
 #include <boost/asio/ip/tcp.hpp>
 
 StreamerDaemon::StreamerDaemon(const AppConfig& cfg) : config_(cfg) {}
@@ -244,22 +245,108 @@ void StreamerDaemon::inject_peer(const std::string& hash, const std::string& ip_
     }
 }
 
+// Helper function to tag URLs automatically
+static std::string guess_media_type(const std::string& url) {
+    std::string lower_url = url;
+    std::transform(lower_url.begin(), lower_url.end(), lower_url.begin(), ::tolower);
+
+    if (lower_url.find("twimg.com") != std::string::npos) {
+        if (lower_url.find(".m3u8") != std::string::npos) return "TW/X PLAYLIST";
+        if (lower_url.find("/vid/") != std::string::npos) return "TW/X VIDEO";
+        if (lower_url.find("/aud/") != std::string::npos) return "TW/X AUDIO";
+        return "TW/X MEDIA";
+    }
+    if (lower_url.find("instagram") != std::string::npos || lower_url.find("cdninstagram") != std::string::npos) return "IG MEDIA";
+    if (lower_url.find("tiktok.com") != std::string::npos) return "TIKTOK";
+    if (lower_url.find("redgifs.com") != std::string::npos) {
+        if (lower_url.find("/hd.") != std::string::npos) return "REDGIFS HD";
+        if (lower_url.find("/sd.") != std::string::npos) return "REDGIFS SD";
+        return "REDGIFS";
+    }
+    if (lower_url.find("gofile.io") != std::string::npos) return "GOFILE";
+    if (lower_url.find("k2s.cc") != std::string::npos || lower_url.find("keep2share") != std::string::npos) return "KEEP2SHARE";
+    if (lower_url.find("filestore.app") != std::string::npos || lower_url.find("tezfiles") != std::string::npos) return "TEZFILES";
+    
+    if (lower_url.find(".m3u8") != std::string::npos) return "HLS PLAYLIST";
+    if (lower_url.find(".mp4") != std::string::npos) return "MP4 VIDEO";
+    if (lower_url.find(".webm") != std::string::npos) return "WEBM VIDEO";
+    
+    return "WEB MEDIA";
+}
+
 void StreamerDaemon::start_sniffer() {
     if (!sniffer_) {
         sniffer_ = std::make_shared<NetworkSniffer>("wlan0", 
             [this](const std::string& url, const httplib::Headers& headers) {
-                std::lock_guard<std::mutex> lock(sniff_mtx_);
                 auto time_t_now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                 char time_buf[20];
                 std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&time_t_now));
 
-                intercept_queue_.push_back({url, headers, time_buf});
+                std::string tag = guess_media_type(url);
+
+                {
+                    std::lock_guard<std::mutex> lock(sniff_mtx_);
+                    intercept_queue_.push_back({url, headers, time_buf, -1, tag});
+                }
                 
                 std::print("\r\033[K"); 
                 std::println("[SNIFFER] Captured new media stream! (Total in queue: {})", intercept_queue_.size());
                 std::println("          Type 'sniff list' to view or 'sniff play {}' to stream.", intercept_queue_.size() - 1);
                 std::print("daemon> ");
                 std::fflush(stdout);
+
+                // =========================================================================
+                // THE BACKGROUND SIZE PROBE
+                // Instantly checks the CDN for the actual file size without blocking the UI
+                // =========================================================================
+                std::thread([this, url, headers]() {
+                    size_t p_pos = url.find("://");
+                    size_t h_start = (p_pos != std::string::npos) ? p_pos + 3 : 0;
+                    size_t path_start = url.find('/', h_start);
+                    std::string host = (path_start == std::string::npos) ? url : url.substr(0, path_start);
+                    std::string path = (path_start == std::string::npos) ? "/" : url.substr(path_start);
+
+                    httplib::Client cli(host);
+                    cli.enable_server_certificate_verification(false);
+                    cli.set_connection_timeout(3);
+                    cli.set_read_timeout(3);
+                    
+                    httplib::Headers safe_headers;
+                    for (const auto& [k, v] : headers) {
+                        std::string kl = k; std::transform(kl.begin(), kl.end(), kl.begin(), ::tolower);
+                        if (kl != "host" && kl != "range" && kl != "connection" && kl != "accept-encoding") {
+                            std::string cv = v, ck = k;
+                            cv.erase(std::remove(cv.begin(), cv.end(), '\r'), cv.end());
+                            cv.erase(std::remove(cv.begin(), cv.end(), '\n'), cv.end());
+                            safe_headers.emplace(ck, cv);
+                        }
+                    }
+
+                    auto res = cli.Head(path.c_str(), safe_headers);
+                    std::int64_t size = -1;
+                    
+                    if (res && res->has_header("Content-Length")) {
+                        size = std::stoll(res->get_header_value("Content-Length"));
+                    } else if (!res || res->status >= 400) {
+                        safe_headers.emplace("Range", "bytes=0-0");
+                        auto get_res = cli.Get(path.c_str(), safe_headers);
+                        if (get_res && get_res->status == 206 && get_res->has_header("Content-Range")) {
+                            std::string cr = get_res->get_header_value("Content-Range");
+                            size_t slash = cr.find('/');
+                            if (slash != std::string::npos) size = std::stoll(cr.substr(slash + 1));
+                        }
+                    }
+
+                    if (size > 0) {
+                        std::lock_guard<std::mutex> lock(sniff_mtx_);
+                        for (auto& s : intercept_queue_) {
+                            if (s.url == url) {
+                                s.size_bytes = size;
+                                break;
+                            }
+                        }
+                    }
+                }).detach();
             }
         );
         sniffer_->start();
@@ -286,8 +373,15 @@ void StreamerDaemon::list_sniffed() {
         std::println("\n=== Intercepted Stream Queue ===");
         for (size_t i = 0; i < intercept_queue_.size(); ++i) {
             std::string display_url = intercept_queue_[i].url;
-            if (display_url.length() > 90) display_url = display_url.substr(0, 87) + "...";
-            std::println(" [{}] [{}] {}", i, intercept_queue_[i].timestamp, display_url);
+            if (display_url.length() > 60) display_url = display_url.substr(0, 57) + "...";
+            
+            std::string size_str = "Unknown";
+            if (intercept_queue_[i].size_bytes >= 0) {
+                if (intercept_queue_[i].size_bytes < 1024*1024) size_str = std::format("{:.1f} KB", intercept_queue_[i].size_bytes / 1024.0);
+                else size_str = std::format("{:.1f} MB", intercept_queue_[i].size_bytes / 1048576.0);
+            }
+            
+            std::println(" [{}] [{}] [{:<8}] [{:<13}] {}", i, intercept_queue_[i].timestamp, size_str, intercept_queue_[i].domain_tag, display_url);
         }
         std::println("================================\n");
     }
@@ -315,4 +409,9 @@ void StreamerDaemon::clear_sniffed() {
     std::lock_guard<std::mutex> lock(sniff_mtx_);
     intercept_queue_.clear();
     std::println("[*] Intercept queue cleared.");
+}
+
+std::vector<InterceptedStream> StreamerDaemon::get_intercept_queue() {
+    std::lock_guard<std::mutex> lock(sniff_mtx_);
+    return intercept_queue_;
 }

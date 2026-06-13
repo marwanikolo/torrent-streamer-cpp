@@ -15,6 +15,8 @@ struct InterceptedStream {
     std::string url;
     httplib::Headers headers;
     std::string timestamp;
+    std::int64_t size_bytes = -1;  // <-- NEW: Holds the file size
+    std::string domain_tag = "";   // <-- NEW: Holds the clean [TAG]
 };
 
 class StreamerDaemon {
@@ -36,6 +38,7 @@ public:
     void list_sniffed();
     void play_sniffed(const std::vector<size_t>& indices);
     void clear_sniffed();
+    std::vector<InterceptedStream> get_intercept_queue(); // <-- ADD THIS
 
 private:
     AppConfig config_;

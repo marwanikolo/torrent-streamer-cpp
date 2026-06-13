@@ -10,4 +10,9 @@ public:
 private:
     StreamerDaemon& daemon_;
     AppConfig config_;
+
+    // POSIX TUI Helpers
+    void set_terminal_raw_mode(bool enable);
+    int read_keypress();
+    void launch_dashboard();
 };
