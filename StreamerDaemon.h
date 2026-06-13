@@ -17,6 +17,8 @@ struct InterceptedStream {
     std::string timestamp;
     std::int64_t size_bytes = -1;  // <-- NEW: Holds the file size
     std::string domain_tag = "";   // <-- NEW: Holds the clean [TAG]
+    std::string content_type = ""; // <-- NEW: Holds the MIME type
+    std::string resolution = ""; // <-- NEW: Holds the ffprobe resolution
 };
 
 class StreamerDaemon {

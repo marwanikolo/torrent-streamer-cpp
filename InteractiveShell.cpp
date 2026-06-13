@@ -23,11 +23,11 @@ void InteractiveShell::set_terminal_raw_mode(bool enable) {
         newt.c_cc[VMIN] = 0;  // Non-blocking read
         newt.c_cc[VTIME] = 5; // 0.5 second timeout so UI refreshes live
         tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-        // FIX: Switch to Alternate Screen Buffer to prevent terminal scrolling glitches!
+        // Switch to Alternate Screen Buffer to prevent terminal scrolling glitches!
         std::print("\033[?1049h\033[?25l"); 
     } else {
         tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-        // FIX: Restore normal terminal buffer and show cursor
+        // Restore normal terminal buffer and show cursor
         std::print("\033[?1049l\033[?25h"); 
     }
     std::fflush(stdout);
@@ -67,18 +67,20 @@ void InteractiveShell::launch_dashboard() {
     bool execute_play = false;
 
     set_terminal_raw_mode(true);
+    std::print("\033[2J"); // Hard clear terminal once before looping
 
     while (running) {
+        // Fetch queue EVERY frame so file sizes, types, and resolutions magically populate!
         auto queue = daemon_.get_intercept_queue(); 
         if (checked.size() < queue.size()) checked.resize(queue.size(), false);
 
-        std::print("\033[H"); // Move to top-left of the Alternate Screen Buffer
-        std::print("================================================================================\033[K\n");
-        std::print("                          INTERACTIVE MEDIA DASHBOARD                           \033[K\n");
-        std::print("================================================================================\033[K\n");
-        std::print(" [↑/↓] Navigate  |  [Space] Select Multiple  |  [Enter] Play Selected Streams \033[K\n");
-        std::print(" [C] Clear Queue |  [Q] Exit Dashboard                                        \033[K\n");
-        std::print("--------------------------------------------------------------------------------\033[K\n");
+        std::print("\033[H"); // Move to top-left of the Alternate Screen Buffer (Anti-flicker technique)
+        std::print("==========================================================================================================\033[K\n");
+        std::print("                                      INTERACTIVE MEDIA DASHBOARD                                         \033[K\n");
+        std::print("==========================================================================================================\033[K\n");
+        std::print(" [↑/↓] Navigate  |  [Space] Select Multiple  |  [Enter] Play Selected Streams                             \033[K\n");
+        std::print(" [C] Clear Queue |  [Q] Exit Dashboard                                                                      \033[K\n");
+        std::print("----------------------------------------------------------------------------------------------------------\033[K\n");
 
         size_t max_display = 20;
         size_t start_idx = (selected_idx / max_display) * max_display;
@@ -91,19 +93,34 @@ void InteractiveShell::launch_dashboard() {
             std::string pointer = (i == selected_idx) ? "  > " : "    ";
             std::string checkbox = checked[i] ? "[x]" : "[ ]";
             
+            // Format Size
             std::string size_str = "Probe...";
             if (queue[i].size_bytes >= 0) {
                 if (queue[i].size_bytes < 1024) size_str = std::to_string(queue[i].size_bytes) + " B";
                 else if (queue[i].size_bytes < 1048576) size_str = std::format("{:.1f} KB", queue[i].size_bytes / 1024.0);
                 else size_str = std::format("{:.1f} MB", queue[i].size_bytes / 1048576.0);
             }
+
+            // Format MIME Type
+            std::string c_type = queue[i].content_type.empty() ? "Probe..." : queue[i].content_type;
+            if (c_type.find("video/mp4") != std::string::npos) c_type = "vid/mp4";
+            else if (c_type.find("audio/mp4") != std::string::npos) c_type = "aud/mp4";
+            else if (c_type.find("video/webm") != std::string::npos) c_type = "vid/webm";
+            else if (c_type.find("mpegurl") != std::string::npos || c_type.find("m3u8") != std::string::npos) c_type = "m3u8/hls";
+            else if (c_type.length() > 9) c_type = c_type.substr(0, 9);
             
+            // Format Resolution
+            std::string res_str = queue[i].resolution.empty() ? "---" : queue[i].resolution;
+
+            // Padding Alignment
             std::string sz_pad = size_str; while(sz_pad.length() < 9) sz_pad = " " + sz_pad;
+            std::string type_pad = c_type; while(type_pad.length() < 9) type_pad += " ";
+            std::string res_pad = res_str; while(res_pad.length() < 11) res_pad += " ";
             std::string tag_pad = queue[i].domain_tag; while(tag_pad.length() < 13) tag_pad += " ";
 
             // Truncate heavily to absolutely guarantee no terminal line-wrapping (fixes UI tearing)
             std::string display_url = queue[i].url;
-            if (display_url.length() > 40) display_url = display_url.substr(0, 37) + "...";
+            if (display_url.length() > 30) display_url = display_url.substr(0, 27) + "...";
 
             // ==========================================================
             // SMART COLOR CODING SYSTEM
@@ -126,12 +143,22 @@ void InteractiveShell::launch_dashboard() {
                 else if (queue[i].domain_tag.find("REDGIFS") != std::string::npos) color_code = "\033[31m"; // Red
             }
             
-            std::print("{}{}{} [{}] [{}] [{}] {}\033[0m\033[K\n", color_code, pointer, checkbox, queue[i].timestamp, sz_pad, tag_pad, display_url);
+            // Injected [res_pad] as a new column
+            std::print("{}{}{} [{}] [{}] [{}] [{}] [{}] {}\033[0m\033[K\n", color_code, pointer, checkbox, queue[i].timestamp, sz_pad, type_pad, res_pad, tag_pad, display_url);
+        }
+
+        // ==========================================================
+        // THE GHOST ERASER
+        // Pad the rest of the page with empty lines to overwrite old data
+        // ==========================================================
+        for (size_t i = end_idx; i < start_idx + max_display; ++i) {
+            std::print("\033[K\n");
         }
 
         if (end_idx < queue.size()) std::print("   ... (scroll down for more)\033[K\n");
         else std::print("\033[K\n");
 
+        // Clear any remaining lines below our menu to ensure a clean visual
         for(int i=0; i<3; ++i) std::print("\033[K\n");
 
         std::fflush(stdout);

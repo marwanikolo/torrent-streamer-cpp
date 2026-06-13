@@ -58,7 +58,6 @@ void StreamerDaemon::shutdown() {
     
     if (sniffer_) sniffer_->stop();
     
-    // 1. Gracefully kill Direct HTTP Streams
     {
         std::unique_lock<std::shared_mutex> d_lock(direct_mtx_);
         for (auto& [id, handle] : active_direct_streams_) {
@@ -76,7 +75,6 @@ void StreamerDaemon::shutdown() {
         }
     }
     
-    // 2. Gracefully kill Torrent Streams
     manager_.ses.pause();
     int outstanding = 0;
     for (auto& [hash, state] : manager_.active_streams) {
@@ -245,7 +243,6 @@ void StreamerDaemon::inject_peer(const std::string& hash, const std::string& ip_
     }
 }
 
-// Helper function to tag URLs automatically
 static std::string guess_media_type(const std::string& url) {
     std::string lower_url = url;
     std::transform(lower_url.begin(), lower_url.end(), lower_url.begin(), ::tolower);
@@ -266,6 +263,7 @@ static std::string guess_media_type(const std::string& url) {
     if (lower_url.find("gofile.io") != std::string::npos) return "GOFILE";
     if (lower_url.find("k2s.cc") != std::string::npos || lower_url.find("keep2share") != std::string::npos) return "KEEP2SHARE";
     if (lower_url.find("filestore.app") != std::string::npos || lower_url.find("tezfiles") != std::string::npos) return "TEZFILES";
+    if (lower_url.find("pixeldrain.com") != std::string::npos) return "PIXELDRAIN";
     
     if (lower_url.find(".m3u8") != std::string::npos) return "HLS PLAYLIST";
     if (lower_url.find(".mp4") != std::string::npos) return "MP4 VIDEO";
@@ -278,15 +276,18 @@ void StreamerDaemon::start_sniffer() {
     if (!sniffer_) {
         sniffer_ = std::make_shared<NetworkSniffer>("wlan0", 
             [this](const std::string& url, const httplib::Headers& headers) {
+                
+                std::string tag = guess_media_type(url);
+                bool is_playlist = (tag.find("PLAYLIST") != std::string::npos);
+
                 auto time_t_now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                 char time_buf[20];
                 std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&time_t_now));
 
-                std::string tag = guess_media_type(url);
-
                 {
                     std::lock_guard<std::mutex> lock(sniff_mtx_);
-                    intercept_queue_.push_back({url, headers, time_buf, -1, tag});
+                    std::string init_type = is_playlist ? "m3u8/hls" : "";
+                    intercept_queue_.push_back({url, headers, time_buf, -1, tag, init_type, ""});
                 }
                 
                 std::print("\r\033[K"); 
@@ -296,57 +297,97 @@ void StreamerDaemon::start_sniffer() {
                 std::fflush(stdout);
 
                 // =========================================================================
-                // THE BACKGROUND SIZE PROBE
-                // Instantly checks the CDN for the actual file size without blocking the UI
+                // THE BACKGROUND PROBE (Size, Content-Type, AND ffprobe Resolution)
                 // =========================================================================
-                std::thread([this, url, headers]() {
-                    size_t p_pos = url.find("://");
-                    size_t h_start = (p_pos != std::string::npos) ? p_pos + 3 : 0;
-                    size_t path_start = url.find('/', h_start);
-                    std::string host = (path_start == std::string::npos) ? url : url.substr(0, path_start);
-                    std::string path = (path_start == std::string::npos) ? "/" : url.substr(path_start);
+                if (!is_playlist) {
+                    std::thread([this, url, headers]() {
+                        size_t p_pos = url.find("://");
+                        size_t h_start = (p_pos != std::string::npos) ? p_pos + 3 : 0;
+                        size_t path_start = url.find('/', h_start);
+                        std::string host = (path_start == std::string::npos) ? url : url.substr(0, path_start);
+                        std::string path = (path_start == std::string::npos) ? "/" : url.substr(path_start);
 
-                    httplib::Client cli(host);
-                    cli.enable_server_certificate_verification(false);
-                    cli.set_connection_timeout(3);
-                    cli.set_read_timeout(3);
-                    
-                    httplib::Headers safe_headers;
-                    for (const auto& [k, v] : headers) {
-                        std::string kl = k; std::transform(kl.begin(), kl.end(), kl.begin(), ::tolower);
-                        if (kl != "host" && kl != "range" && kl != "connection" && kl != "accept-encoding") {
-                            std::string cv = v, ck = k;
-                            cv.erase(std::remove(cv.begin(), cv.end(), '\r'), cv.end());
-                            cv.erase(std::remove(cv.begin(), cv.end(), '\n'), cv.end());
-                            safe_headers.emplace(ck, cv);
-                        }
-                    }
-
-                    auto res = cli.Head(path.c_str(), safe_headers);
-                    std::int64_t size = -1;
-                    
-                    if (res && res->has_header("Content-Length")) {
-                        size = std::stoll(res->get_header_value("Content-Length"));
-                    } else if (!res || res->status >= 400) {
-                        safe_headers.emplace("Range", "bytes=0-0");
-                        auto get_res = cli.Get(path.c_str(), safe_headers);
-                        if (get_res && get_res->status == 206 && get_res->has_header("Content-Range")) {
-                            std::string cr = get_res->get_header_value("Content-Range");
-                            size_t slash = cr.find('/');
-                            if (slash != std::string::npos) size = std::stoll(cr.substr(slash + 1));
-                        }
-                    }
-
-                    if (size > 0) {
-                        std::lock_guard<std::mutex> lock(sniff_mtx_);
-                        for (auto& s : intercept_queue_) {
-                            if (s.url == url) {
-                                s.size_bytes = size;
-                                break;
+                        httplib::Client cli(host);
+                        cli.enable_server_certificate_verification(false);
+                        cli.set_connection_timeout(3);
+                        cli.set_read_timeout(3);
+                        
+                        httplib::Headers safe_headers;
+                        std::string ffprobe_headers = ""; // Build the header string for ffprobe
+                        
+                        for (const auto& [k, v] : headers) {
+                            std::string kl = k; std::transform(kl.begin(), kl.end(), kl.begin(), ::tolower);
+                            if (kl != "host" && kl != "range" && kl != "connection" && kl != "accept-encoding") {
+                                std::string cv = v, ck = k;
+                                cv.erase(std::remove(cv.begin(), cv.end(), '\r'), cv.end());
+                                cv.erase(std::remove(cv.begin(), cv.end(), '\n'), cv.end());
+                                safe_headers.emplace(ck, cv);
+                                ffprobe_headers += ck + ": " + cv + "\r\n";
                             }
                         }
-                    }
-                }).detach();
+
+                        // 1. Lightweight HEAD request for Size and Type
+                        auto res = cli.Head(path.c_str(), safe_headers);
+                        std::int64_t size = -1;
+                        std::string c_type = "";
+                        
+                        if (res && res->status < 400) {
+                            if (res->has_header("Content-Length")) size = std::stoll(res->get_header_value("Content-Length"));
+                            if (res->has_header("Content-Type")) c_type = res->get_header_value("Content-Type");
+                        } else {
+                            safe_headers.emplace("Range", "bytes=0-0");
+                            auto get_res = cli.Get(path.c_str(), safe_headers);
+                            if (get_res && get_res->status == 206) {
+                                if (get_res->has_header("Content-Range")) {
+                                    std::string cr = get_res->get_header_value("Content-Range");
+                                    size_t slash = cr.find('/');
+                                    if (slash != std::string::npos) size = std::stoll(cr.substr(slash + 1));
+                                }
+                                if (get_res->has_header("Content-Type")) c_type = get_res->get_header_value("Content-Type");
+                            }
+                        }
+
+                        // 2. Heavy ffprobe execution (Only if it looks like actual media)
+                        std::string resolution = "";
+                        if (size > 100000 || c_type.find("video") != std::string::npos) { 
+                            auto escape_sh = [](std::string s) {
+                                size_t pos = 0;
+                                while ((pos = s.find('\'', pos)) != std::string::npos) {
+                                    s.replace(pos, 1, "'\\''");
+                                    pos += 4;
+                                }
+                                return s;
+                            };
+
+                            // The magic ffprobe CSV formatter
+                            std::string cmd = std::format("ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 -headers '{}' '{}' 2>/dev/null", escape_sh(ffprobe_headers), escape_sh(url));
+                            
+                            FILE* pipe = popen(cmd.c_str(), "r");
+                            if (pipe) {
+                                char buffer[128];
+                                if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                                    resolution = buffer;
+                                    resolution.erase(std::remove(resolution.begin(), resolution.end(), '\n'), resolution.end());
+                                    resolution.erase(std::remove(resolution.begin(), resolution.end(), '\r'), resolution.end());
+                                }
+                                pclose(pipe);
+                            }
+                        }
+
+                        // 3. Update the UI Struct safely
+                        if (size > 0 || !c_type.empty() || !resolution.empty()) {
+                            std::lock_guard<std::mutex> lock(sniff_mtx_);
+                            for (auto& s : intercept_queue_) {
+                                if (s.url == url) {
+                                    if (size > 0) s.size_bytes = size;
+                                    if (!c_type.empty()) s.content_type = c_type;
+                                    if (!resolution.empty()) s.resolution = resolution;
+                                    break;
+                                }
+                            }
+                        }
+                    }).detach();
+                }
             }
         );
         sniffer_->start();
@@ -366,6 +407,7 @@ void StreamerDaemon::stop_sniffer() {
 }
 
 void StreamerDaemon::list_sniffed() {
+    // Legacy fallback, we use InteractiveShell's dashboard now
     std::lock_guard<std::mutex> lock(sniff_mtx_);
     if (intercept_queue_.empty()) {
         std::println("[*] No streams intercepted yet. Make sure 'sniff start' is running.");
@@ -374,14 +416,7 @@ void StreamerDaemon::list_sniffed() {
         for (size_t i = 0; i < intercept_queue_.size(); ++i) {
             std::string display_url = intercept_queue_[i].url;
             if (display_url.length() > 60) display_url = display_url.substr(0, 57) + "...";
-            
-            std::string size_str = "Unknown";
-            if (intercept_queue_[i].size_bytes >= 0) {
-                if (intercept_queue_[i].size_bytes < 1024*1024) size_str = std::format("{:.1f} KB", intercept_queue_[i].size_bytes / 1024.0);
-                else size_str = std::format("{:.1f} MB", intercept_queue_[i].size_bytes / 1048576.0);
-            }
-            
-            std::println(" [{}] [{}] [{:<8}] [{:<13}] {}", i, intercept_queue_[i].timestamp, size_str, intercept_queue_[i].domain_tag, display_url);
+            std::println(" [{}] [{}] {}", i, intercept_queue_[i].timestamp, display_url);
         }
         std::println("================================\n");
     }
