@@ -4,9 +4,11 @@
 #include <format>
 #include <algorithm>
 #include <thread>
+#include <fstream>
+#include <filesystem>
 
-HttpProxyServer::HttpProxyServer(HttpCacheManager& cache, HttpDownloader& downloader, const std::string& video_url, int port, const std::string& stream_id, bool debug, const httplib::Headers& headers)
-    : cache_(cache), downloader_(downloader), video_url_(video_url), port_(port), stream_id_(stream_id), debug_(debug), extra_headers_(headers) {
+HttpProxyServer::HttpProxyServer(HttpCacheManager& cache, HttpDownloader& downloader, const std::string& video_url, int port, const std::string& stream_id, bool debug, const httplib::Headers& headers, bool is_hls, const std::string& hls_playlist, const std::vector<std::string>& hls_chunks, const std::string& hls_save_dir)
+    : cache_(cache), downloader_(downloader), video_url_(video_url), port_(port), stream_id_(stream_id), debug_(debug), extra_headers_(headers), is_hls_(is_hls), hls_playlist_text_(hls_playlist), hls_chunk_urls_(hls_chunks), hls_save_dir_(hls_save_dir) {
     
     size_t protocol_pos = video_url_.find("://");
     size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
@@ -29,7 +31,6 @@ HttpProxyServer::~HttpProxyServer() {
 void HttpProxyServer::start() {
     svr_.new_task_queue = [] { return new httplib::ThreadPool(64); };
     
-    // --- UPGRADED: Assign to std::jthread ---
     server_thread_ = std::jthread([this](std::stop_token stoken) {
         svr_.listen("0.0.0.0", port_);
     });
@@ -42,15 +43,11 @@ void HttpProxyServer::stop() {
     
     svr_.stop();
     
-    // --- UPGRADED: Temporary jthread unblocker ---
-    // The destructor of this jthread will safely block until the GET request finishes
     std::jthread unblocker([this]() {
         httplib::Client cli("localhost", port_);
         cli.set_connection_timeout(0, 100000); 
         cli.Get("/"); 
     });
-    
-    // We no longer need server_thread_.join() because jthread handles it!
 }
 
 void HttpProxyServer::setup_routes() {
@@ -58,6 +55,74 @@ void HttpProxyServer::setup_routes() {
         svr_.set_logger([this](const httplib::Request& req, const httplib::Response& res) {
             std::string range = req.has_header("Range") ? req.get_header_value("Range") : "None";
             write_debug_log(debug_, "[PROX] {} {} | Range: {} | Status: {}", req.method, req.path, range, res.status);
+        });
+    }
+
+    if (is_hls_) {
+        std::string playlist_route = "/playlist.m3u8";
+        svr_.Get(playlist_route, [this](const httplib::Request&, httplib::Response& res) {
+            write_debug_log(debug_, "[PROX] Serving modified HLS playlist to player.");
+            res.set_content(hls_playlist_text_, "application/vnd.apple.mpegurl");
+        });
+
+        std::string chunk_route = R"(/chunk/(\d+))";
+        svr_.Get(chunk_route, [this](const httplib::Request& req, httplib::Response& res) {
+            int chunk_index = 0;
+            try {
+                chunk_index = std::stoi(req.matches[1]);
+            } catch (...) {
+                res.status = 404;
+                return;
+            }
+            
+            if (chunk_index < 0 || chunk_index >= hls_chunk_urls_.size()) {
+                res.status = 404;
+                return;
+            }
+
+            std::string chunk_file_path = std::format("{}/chunk_{}.ts", hls_save_dir_, chunk_index);
+
+            std::error_code ec;
+            if (std::filesystem::exists(chunk_file_path, ec)) {
+                std::ifstream ifs(chunk_file_path, std::ios::binary | std::ios::ate);
+                if (ifs) {
+                    std::streamsize size = ifs.tellg();
+                    ifs.seekg(0, std::ios::beg);
+                    std::string buffer(size, '\0');
+                    
+                    if (ifs.read(buffer.data(), size)) {
+                        write_debug_log(debug_, "[PROX] HLS Cache HIT: Serving chunk {} from disk.", chunk_index);
+                        res.set_content(buffer, "video/MP2T");
+                        return; 
+                    }
+                }
+            }
+
+            std::string target_chunk_url = hls_chunk_urls_[chunk_index];
+            std::string c_host, c_path;
+            size_t protocol_pos = target_chunk_url.find("://");
+            size_t host_start = (protocol_pos != std::string::npos) ? protocol_pos + 3 : 0;
+            size_t path_start = target_chunk_url.find('/', host_start);
+            c_host = target_chunk_url.substr(0, path_start);
+            c_path = target_chunk_url.substr(path_start);
+
+            httplib::Client cli(c_host);
+            cli.set_follow_location(true);
+            cli.enable_server_certificate_verification(false); 
+            
+            auto web_res = cli.Get(c_path.c_str(), extra_headers_);
+
+            if (web_res && (web_res->status == 200 || web_res->status == 206)) {
+                std::ofstream ofs(chunk_file_path, std::ios::binary);
+                if (ofs) {
+                    ofs.write(web_res->body.data(), web_res->body.size());
+                }
+                
+                res.set_content(web_res->body, "video/MP2T");
+            } else {
+                write_debug_log(debug_, "[PROX] Failed to fetch CDN chunk {}. Status: {}", chunk_index, web_res ? web_res->status : 0);
+                res.status = 404;
+            }
         });
     }
 
@@ -88,6 +153,7 @@ void HttpProxyServer::setup_routes() {
                 httplib::Client cli(host_);
                 cli.set_keep_alive(true);
                 cli.set_follow_location(true);
+                cli.enable_server_certificate_verification(false);
 
                 while (bytes_left > 0) {
                     if (is_shutting_down_ || my_id < current_request_id_) return false;
@@ -110,29 +176,21 @@ void HttpProxyServer::setup_routes() {
 
                     std::int64_t req_end = std::min<std::int64_t>(current_byte + bytes_left - 1, chunk_end);
                     
-                    // Merge requested range with the yt-dlp headers
                     httplib::Headers req_headers = extra_headers_;
                     req_headers.emplace("Range", std::format("bytes={}-{}", current_byte, req_end));
                     
                     bool abort_proxy = false;
                     
-                    // =========================================================================
-                    // UPGRADED: Two-stage HTTP GET (Status Check -> Content Stream)
-                    // =========================================================================
                     auto web_res = cli.Get(path_.c_str(), req_headers, 
-                        
-                        // 1. RESPONSE HANDLER: Bouncer checks the status code first
                         [&](const httplib::Response& response) {
                             if (response.status != 200 && response.status != 206) {
                                 write_debug_log(debug_, "[PROX] CRITICAL: CDN returned HTTP {}. Aborting stream to prevent cache poisoning.", response.status);
-                                std::println(stderr, "[-] Proxy Error: CDN returned HTTP {} (Link expired or IP rate-limited)", response.status);
+                                std::println(stderr, "[-] Proxy Error: CDN returned HTTP {}", response.status);
                                 abort_proxy = true;
-                                return false; // Aborts connection immediately!
+                                return false; 
                             }
                             return true;
                         },
-                        
-                        // 2. CONTENT RECEIVER: Only runs if the status is 200/206
                         [&](const char *data, size_t data_length) {
                             if (is_shutting_down_ || my_id < current_request_id_) {
                                 abort_proxy = true;

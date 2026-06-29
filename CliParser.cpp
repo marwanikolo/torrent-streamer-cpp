@@ -1,4 +1,5 @@
 #include "CliParser.h"
+#include "Utils.h" // Add this include
 #include <cstdlib>
 #include <string>
 #include <print>
@@ -22,6 +23,19 @@ AppConfig parse_cli_args(int argc, char* argv[]) {
         else if (arg == "--gofile-token" && i + 1 < argc) config.gofile_token = argv[++i];
         else if (arg == "--user-agent" && i + 1 < argc) config.custom_user_agent = argv[++i];
         else if (arg == "--referer" && i + 1 < argc) config.custom_referer = argv[++i];
+        
+        // NEW: Intercept Burp File and dump it into custom_headers
+        else if ((arg == "-b" || arg == "--burp") && i + 1 < argc) {
+            std::string burp_path = argv[++i];
+            auto extracted_headers = parse_burp_file(burp_path);
+            
+            // Insert all found headers into the existing custom_headers config
+            config.custom_headers.insert(
+                config.custom_headers.end(), 
+                extracted_headers.begin(), 
+                extracted_headers.end()
+            );
+        }
         
         // Arbitrary Header Parser (-H or --header)
         else if ((arg == "-H" || arg == "--header") && i + 1 < argc) {

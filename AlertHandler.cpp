@@ -10,6 +10,7 @@
 #include <chrono>
 #include <shared_mutex>
 #include <algorithm>
+#include <map>
 
 extern std::atomic<bool> interrupted;
 
@@ -17,10 +18,15 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
     write_debug_log(debug_mode, "[SYST] Multi-Torrent Alert Loop Thread Started");
     
     auto last_telemetry_time = std::chrono::steady_clock::now();
+    std::map<std::string, int64_t> previous_download_bytes;
 
+    std::vector<lt::alert*> alerts;
+    alerts.reserve(512);
+    
     while (!interrupted.load()) {
         manager.ses.wait_for_alert(lt::milliseconds(200));
-        std::vector<lt::alert*> alerts;
+        
+        alerts.clear();
         manager.ses.pop_alerts(&alerts);
 
         for (lt::alert* a : alerts) {
@@ -57,30 +63,50 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
             }
         }
 
-        // --- TELEMETRY TICKER ---
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_telemetry_time).count() >= 5) {
+        double elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_telemetry_time).count();
+
+        if (elapsed_seconds >= 5.0) {
             last_telemetry_time = now;
             
             std::shared_lock<std::shared_mutex> lock(manager.registry_mtx);
+
+            // Clean up hashes for torrents that have been removed
+            for (auto it = previous_download_bytes.begin(); it != previous_download_bytes.end(); ) {
+                if (manager.active_streams.find(it->first) == manager.active_streams.end()) {
+                    it = previous_download_bytes.erase(it);
+                } else {
+                    ++it;
+                }
+            }
             
             bool is_first = true;
             for (const auto& [hash, state] : manager.active_streams) {
                 if (state->shutting_down.load() || !state->h.is_valid()) continue;
                 
-                // --- NEW: Visual Formatting ---
                 if (is_first) {
-                    // Drops a blank timestamped line to separate this 5-second tick from previous logs
                     write_debug_log(debug_mode, ""); 
                     is_first = false;
                 } else {
-                    // Prints a dashed line to separate different active torrent streams
                     write_debug_log(debug_mode, "----------------------------------------------------------------------------------");
                 }
-                // ------------------------------
                 
                 lt::torrent_status ts = state->h.status();
-                double dl_rate = ts.download_payload_rate / 1048576.0; 
+                
+                int64_t current_bytes = ts.total_payload_download;
+                double dl_rate = 0.0;
+                
+                auto it = previous_download_bytes.find(hash);
+                if (it != previous_download_bytes.end()) {
+                    int64_t previous_bytes = it->second;
+                    if (current_bytes > previous_bytes) {
+                        dl_rate = ((current_bytes - previous_bytes) / elapsed_seconds) / 1048576.0;
+                    }
+                } else {
+                    dl_rate = ts.download_payload_rate / 1048576.0;
+                }
+                previous_download_bytes[hash] = current_bytes;
+
                 int peers = ts.num_peers;
                 int current_playhead = state->latest_piece_requested.load();
 
@@ -91,7 +117,6 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
                 }
                 float progress = (static_cast<float>(have_count) / total_file_pieces) * 100.0f;
 
-                // --- 1. FETCH PRIORITIZED WINDOW (The Brain) ---
                 std::vector<int> prioritized_pieces;
                 std::vector<lt::download_priority_t> priorities = state->h.get_piece_priorities();
                 for (int i = 0; i < priorities.size(); ++i) {
@@ -100,46 +125,55 @@ void alert_loop(TorrentManager& manager, const std::string& resume_dir, bool deb
                     }
                 }
                 
-                std::sort(prioritized_pieces.begin(), prioritized_pieces.end(), [&priorities](int a, int b) {
-                    uint8_t prio_a = static_cast<uint8_t>(priorities[a]);
-                    uint8_t prio_b = static_cast<uint8_t>(priorities[b]);
-                    if (prio_a != prio_b) return prio_a > prio_b; 
-                    return a < b; 
-                });
+                size_t win_limit = 12;
+                size_t actual_win_limit = std::min(win_limit, prioritized_pieces.size());
+                if (actual_win_limit > 0) {
+                    std::partial_sort(prioritized_pieces.begin(), prioritized_pieces.begin() + actual_win_limit, prioritized_pieces.end(), [&priorities](int a, int b) {
+                        uint8_t prio_a = static_cast<uint8_t>(priorities[a]);
+                        uint8_t prio_b = static_cast<uint8_t>(priorities[b]);
+                        if (prio_a != prio_b) return prio_a > prio_b; 
+                        return a < b; 
+                    });
+                }
                 
-                std::string win_str = "[";
-                size_t win_limit = 12; 
-                for (size_t i = 0; i < prioritized_pieces.size() && i < win_limit; ++i) {
+                std::string win_str;
+                win_str.reserve(128);
+                win_str = "[";
+                for (size_t i = 0; i < actual_win_limit; ++i) {
                     int p_idx = prioritized_pieces[i];
                     uint8_t p_val = static_cast<uint8_t>(priorities[p_idx]);
                     win_str += std::format("{}(p{})", p_idx, p_val);
-                    if (i < prioritized_pieces.size() - 1 && i < win_limit - 1) win_str += ", ";
+                    if (i < actual_win_limit - 1) win_str += ", ";
                 }
                 if (prioritized_pieces.size() > win_limit) win_str += std::format(" ... +{} more", prioritized_pieces.size() - win_limit);
                 win_str += "]";
                 if (prioritized_pieces.empty()) win_str = "[None]";
 
-                // --- 2. FETCH IN-FLIGHT QUEUE (The Muscle) ---
                 auto queue = state->h.get_download_queue();
                 std::vector<int> inflight_pieces;
                 for (const auto& q : queue) {
                     inflight_pieces.push_back(static_cast<int>(q.piece_index));
                 }
                 
-                std::sort(inflight_pieces.begin(), inflight_pieces.end(), [&priorities](int a, int b) {
-                    uint8_t prio_a = static_cast<uint8_t>(priorities[a]);
-                    uint8_t prio_b = static_cast<uint8_t>(priorities[b]);
-                    if (prio_a != prio_b) return prio_a > prio_b;
-                    return a < b;
-                });
+                size_t flight_limit = 8;
+                size_t actual_flight_limit = std::min(flight_limit, inflight_pieces.size());
+                if (actual_flight_limit > 0) {
+                    std::partial_sort(inflight_pieces.begin(), inflight_pieces.begin() + actual_flight_limit, inflight_pieces.end(), [&priorities](int a, int b) {
+                        uint8_t prio_a = static_cast<uint8_t>(priorities[a]);
+                        uint8_t prio_b = static_cast<uint8_t>(priorities[b]);
+                        if (prio_a != prio_b) return prio_a > prio_b;
+                        return a < b;
+                    });
+                }
                 
-                std::string flight_str = "[";
-                size_t flight_limit = 8; 
-                for (size_t i = 0; i < inflight_pieces.size() && i < flight_limit; ++i) {
+                std::string flight_str;
+                flight_str.reserve(128);
+                flight_str = "[";
+                for (size_t i = 0; i < actual_flight_limit; ++i) {
                     int p_idx = inflight_pieces[i];
                     uint8_t p_val = static_cast<uint8_t>(priorities[p_idx]);
                     flight_str += std::format("{}(p{})", p_idx, p_val);
-                    if (i < inflight_pieces.size() - 1 && i < flight_limit - 1) flight_str += ", ";
+                    if (i < actual_flight_limit - 1) flight_str += ", ";
                 }
                 if (inflight_pieces.size() > flight_limit) flight_str += std::format(" ... +{} more", inflight_pieces.size() - flight_limit);
                 flight_str += "]";

@@ -7,6 +7,7 @@
 #include <format>
 #include <chrono>
 #include <ctime>
+#include <vector>
 
 extern std::mutex g_log_mtx;
 
@@ -42,3 +43,4 @@ inline void write_debug_log(bool debug, std::format_string<Args...> fmt, Args&&.
 
 bool file_exists(const std::string& name);
 std::string get_info_hash_string(const lt::torrent_info& ti);
+std::vector<std::pair<std::string, std::string>> parse_burp_file(const std::string& filepath);

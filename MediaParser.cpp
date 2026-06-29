@@ -147,3 +147,36 @@ std::string generate_hls(const std::vector<MapEntry>& master_index, int64_t tota
     write_debug_log(true, "[HLS ] Generated playlist with {} segments. Target duration: {}s", segments.size(), target_duration);
     return playlist.str();
 }
+
+// --- NEW: Internet HLS Proxy Rewriter ---
+std::string rewrite_remote_hls(const std::string& raw_m3u8, const std::string& base_url, int port, std::vector<std::string>& out_chunk_urls) {
+    std::istringstream stream(raw_m3u8);
+    std::ostringstream rewritten;
+    std::string line;
+    int chunk_index = 0;
+
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        if (line.empty() || line[0] == '#') {
+            rewritten << line << "\n";
+        } else {
+            std::string full_url = line;
+            // Handle relative CDN paths securely
+            if (full_url.find("http") != 0) {
+                if (full_url.front() == '/') {
+                    size_t host_end = base_url.find('/', 8); // Skip https://
+                    if (host_end != std::string::npos) {
+                        full_url = base_url.substr(0, host_end) + full_url;
+                    }
+                } else {
+                    full_url = base_url + full_url;
+                }
+            }
+            out_chunk_urls.push_back(full_url);
+            rewritten << "http://localhost:" << port << "/chunk/" << chunk_index << "\n";
+            chunk_index++;
+        }
+    }
+    return rewritten.str();
+}

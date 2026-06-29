@@ -13,6 +13,7 @@
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <vector>
 
 extern std::atomic<bool> interrupted;
 
@@ -21,11 +22,19 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
     lt::add_torrent_params atp;
     std::string hash_str;
 
-    if (file_exists(source) && source.find(".torrent") != std::string::npos) {
+    if (source.find(".torrent") != std::string::npos) {
+        if (!file_exists(source)) {
+            std::println(stderr, "[-] Error: Torrent file not found on disk: {}", source);
+            return; 
+        }
         atp.ti = std::make_shared<lt::torrent_info>(source);
         hash_str = get_info_hash_string(*atp.ti); 
     } else {
         atp = lt::parse_magnet_uri(source);
+        if (atp.info_hashes.get_best().is_all_zeros()) {
+            std::println(stderr, "[-] Error: Invalid magnet URI provided: {}", source);
+            return;
+        }
         std::stringstream ss;
         ss << atp.info_hashes.get_best();
         hash_str = ss.str();
@@ -39,23 +48,31 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         atp.ti = std::make_shared<lt::torrent_info>(torrent_file_path);
     }
 
+    // Efficient one-shot block read for the fastresume file
     if (file_exists(resume_file_path)) {
-        std::ifstream ifs(resume_file_path, std::ios_base::binary);
-        ifs.unsetf(std::ios_base::skipws);
-        std::vector<char> buf{std::istream_iterator<char>(ifs), std::istream_iterator<char>()};
-        lt::error_code ec;
-        lt::add_torrent_params resume_params = lt::read_resume_data(buf, ec);
-        if (!ec) {
-            auto ti_backup = atp.ti; 
-            atp = resume_params;
-            atp.ti = ti_backup;
-            atp.save_path = config.save_dir;
+        std::ifstream ifs(resume_file_path, std::ios_base::binary | std::ios_base::ate);
+        if (ifs) {
+            std::streamsize size = ifs.tellg();
+            ifs.seekg(0, std::ios_base::beg);
             
-            // --- THE FIX ---
-            // Strip the "paused" flag that gets baked in during daemon shutdown!
-            atp.flags &= ~lt::torrent_flags::paused;
-            atp.flags |= lt::torrent_flags::auto_managed;
-            // ---------------
+            std::vector<char> buf(size);
+            if (ifs.read(buf.data(), size)) {
+                lt::error_code ec;
+                lt::add_torrent_params resume_params = lt::read_resume_data(buf, ec);
+                if (!ec) {
+                    auto ti_backup = atp.ti; 
+                    atp = resume_params;
+                    atp.ti = ti_backup;
+                    
+                    if (ti_backup) {
+                        atp.info_hashes = ti_backup->info_hashes(); 
+                    }
+
+                    atp.save_path = config.save_dir;
+                    atp.flags &= ~lt::torrent_flags::paused;
+                    atp.flags |= lt::torrent_flags::auto_managed;
+                }
+            }
         }
     }
 
@@ -68,27 +85,59 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         atp.trackers.push_back(wss);
     }
 
-    lt::torrent_handle h = manager.ses.add_torrent(atp);
+    lt::info_hash_t target_hash = atp.ti ? atp.ti->info_hashes() : atp.info_hashes;
+    lt::torrent_handle existing_h;
+    
+    if (target_hash.has_v1()) existing_h = manager.ses.find_torrent(target_hash.v1);
+    else if (target_hash.has_v2()) existing_h = manager.ses.find_torrent(target_hash.v2);
+    
+    if (existing_h.is_valid()) {
+        if (!existing_h.status().has_metadata) {
+            std::println("[!] Ghost state detected in daemon memory! Purging dead magnet link...");
+            manager.ses.remove_torrent(existing_h);
+            
+            auto check_exists = [&]() {
+                if (target_hash.has_v1()) return manager.ses.find_torrent(target_hash.v1).is_valid();
+                if (target_hash.has_v2()) return manager.ses.find_torrent(target_hash.v2).is_valid();
+                return false;
+            };
+            
+            while (check_exists()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+    }
 
-    if (!h.status().has_metadata) {
-        std::print("[*] Fetching Metadata for new torrent... ");
+    lt::torrent_handle h = manager.ses.add_torrent(atp);
+    std::shared_ptr<const lt::torrent_info> ti;
+
+    if (atp.ti) {
+        ti = atp.ti;
+    } else {
+        std::print("[*] Fetching Metadata for magnet link... ");
         std::fflush(stdout);
+        
         while (!h.status().has_metadata) {
             if (interrupted.load()) { manager.ses.remove_torrent(h); return; }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         std::println("Done!");
         
-        std::shared_ptr<const lt::torrent_info> ti_new = h.torrent_file();
+        ti = h.torrent_file();
+        
         lt::add_torrent_params temp_atp;
-        temp_atp.ti = std::make_shared<lt::torrent_info>(*ti_new);
+        temp_atp.ti = std::make_shared<lt::torrent_info>(*ti);
         std::ofstream f(torrent_file_path, std::ios_base::binary);
         std::vector<char> buf;
         lt::bencode(std::back_inserter(buf), lt::write_torrent_file(temp_atp));
         f.write(buf.data(), buf.size());
     }
-    
-    std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
+
+    if (!ti) {
+        std::println(stderr, "[-] FATAL: Failed to resolve torrent metadata.");
+        manager.ses.remove_torrent(h);
+        return;
+    }
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -142,7 +191,6 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         return;
     }
 
-    // 1. Set EVERYTHING to 0 priority initially
     for (int i = 0; i < files.num_files(); ++i) {
         h.file_priority(lt::file_index_t(i), lt::download_priority_t{0});
     }
@@ -151,10 +199,8 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
     std::println("  Name: {}", ti->name());
 
     for (int idx : selected_indices) {
-        // 2. Set the target file to priority 1 to PREVENT writing to hidden .parts files!
         h.file_priority(lt::file_index_t(idx), lt::download_priority_t{1});
         
-        // 3. Immediately crush ALL piece priorities to 0 so WindowManager has absolute control
         for (int p = 0; p < ti->num_pieces(); ++p) {
             h.piece_priority(lt::piece_index_t(p), lt::dont_download);
         }
@@ -169,7 +215,6 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         state->first_piece = state->file_offset / state->piece_length;
         state->last_piece = (state->file_offset + state->file_size - 1) / state->piece_length;
 
-        // 4. Fast Start Metadata
         h.piece_priority(lt::piece_index_t(state->first_piece), lt::top_priority);
         h.piece_priority(lt::piece_index_t(state->last_piece), lt::top_priority);
         h.set_piece_deadline(lt::piece_index_t(state->first_piece), 0, lt::torrent_handle::alert_when_available);

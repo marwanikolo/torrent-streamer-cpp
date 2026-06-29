@@ -23,3 +23,14 @@ streamer_debug.log
 opencode.json
 .vscode/
 compile_commands.json
+
+# --- Append to your existing .gitignore ---
+
+# Profiling and Analysis Data
+callgrind.out.*
+perf.data
+perf.data.old
+
+# Local Testing Files
+imra.txt
+my_changes.patch
