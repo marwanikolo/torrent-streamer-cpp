@@ -19,6 +19,8 @@ streamer_debug.log
 *.mpls
 *.m3u8
 *.jpg
+*.txt
+*.burp
 .aider*
 opencode.json
 .vscode/
@@ -34,3 +36,4 @@ perf.data.old
 # Local Testing Files
 imra.txt
 my_changes.patch
+.idea/

@@ -112,18 +112,38 @@ void StreamerDaemon::shutdown() {
 }
 
 void StreamerDaemon::add_stream(const std::string& source, const AppConfig& cfg) {
-    if (source.starts_with("http://") || source.starts_with("https://")) {
+    // 1. Web Links & Local HLS Playlists go to the Proxy Engine
+    if (source.starts_with("http://") || source.starts_with("https://") || source.ends_with(".m3u8")) {
         AppConfig temp_cfg = cfg;
         auto handle = stream_direct_link(temp_cfg, source); 
         std::unique_lock<std::shared_mutex> lock(direct_mtx_);
         active_direct_streams_[handle.stream_id] = handle;
-    } else {
+    } 
+    // 2. Torrents and Magnets go to libtorrent
+    else if (source.find(".torrent") != std::string::npos || source.starts_with("magnet:?")) {
         try {
             AppConfig temp_cfg = cfg;
             handle_torrent(manager_, temp_cfg, source);
         } catch (const std::exception& e) {
             std::println(stderr, "[-] Failed to parse torrent/magnet: {}", e.what());
         }
+    }
+    // 3. Fallback: It is a standard local file (.mp4, .mkv, etc.)
+    else if (std::filesystem::exists(source)) {
+        std::println("[*] Detected local media file. Launching player natively...");
+        pid_t pid = launch_player(cfg, source, "", "");
+        
+        DirectStreamHandle handle;
+        handle.stream_id = "local_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+        handle.player_pid = pid;
+        handle.cancel_token = std::make_shared<std::atomic<bool>>(false);
+        handle.finished_token = std::make_shared<std::atomic<bool>>(true);
+        
+        std::unique_lock<std::shared_mutex> lock(direct_mtx_);
+        active_direct_streams_[handle.stream_id] = handle;
+    }
+    else {
+        std::println(stderr, "[-] Invalid input: Not a valid HTTP link, Magnet URI, or existing local file.");
     }
 }
 

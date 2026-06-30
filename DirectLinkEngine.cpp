@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <sstream>
+#include <fstream>
 
 extern std::atomic<bool> interrupted;
 static std::atomic<int> next_proxy_port{0};
@@ -77,7 +78,10 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         for (auto it = auth_headers.begin(); it != auth_headers.end(); ) {
             std::string k_lower = it->first;
             std::transform(k_lower.begin(), k_lower.end(), k_lower.begin(), ::tolower);
-            if (k_lower == "range" || k_lower == "host" || k_lower == "connection" || k_lower == "accept-encoding") {
+            
+            // --- FIX: Strip out body-specific headers from the Burp file to prevent 400 Bad Requests on GETs ---
+            if (k_lower == "range" || k_lower == "host" || k_lower == "connection" || 
+                k_lower == "accept-encoding" || k_lower == "content-length" || k_lower == "content-type") {
                 it = auth_headers.erase(it);
             } else {
                 ++it;
@@ -105,16 +109,37 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         std::vector<std::string> hls_chunk_urls;
         
         if (is_hls) {
-            std::println("[*] Detected HLS Playlist. Injecting Remote Rewriter...");
-            httplib::Client cli(current_host);
-            cli.enable_server_certificate_verification(false); 
-            auto res = cli.Get(current_path.c_str(), auth_headers);
+            std::string m3u8_body;
+            std::string base_url;
+            
+            if (final_url.starts_with("http://") || final_url.starts_with("https://")) {
+                std::println("[*] Detected Remote HLS Playlist. Injecting Remote Rewriter...");
+                httplib::Client cli(current_host);
+                cli.enable_server_certificate_verification(false); 
+                auto res = cli.Get(current_path.c_str(), auth_headers);
 
-            if (res && res->status == 200) {
-                std::string m3u8_body = res->body;
-                std::string base_url = final_url.substr(0, final_url.find_last_of('/') + 1);
+                if (res && res->status == 200) {
+                    m3u8_body = res->body;
+                    base_url = final_url.substr(0, final_url.find_last_of('/') + 1);
+                } else {
+                    throw std::runtime_error("Failed to download remote m3u8 playlist");
+                }
+            } else {
+                std::println("[*] Detected Local HLS Playlist. Reading from disk...");
+                std::ifstream ifs(final_url);
+                if (!ifs.is_open()) throw std::runtime_error("Failed to open local m3u8 file");
+                
+                std::ostringstream ss;
+                ss << ifs.rdbuf();
+                m3u8_body = ss.str();
+                
+                // Fallback for absolute chunk URLs inside the local file
+                base_url = "http://localhost/"; 
+            }
 
-                if (m3u8_body.find("#EXT-X-STREAM-INF") != std::string::npos) {
+            if (!m3u8_body.empty()) {
+                // Only run variant extraction if we actually fetched a remote master playlist
+                if (m3u8_body.find("#EXT-X-STREAM-INF") != std::string::npos && (final_url.starts_with("http://") || final_url.starts_with("https://"))) {
                     std::println("[*] Master playlist detected. Searching for max bandwidth stream...");
                     uint64_t max_bw = 0;
                     std::string best_url = "";
@@ -139,7 +164,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                     }
 
                     if (!best_url.empty()) {
-                        // FIX: Securely prevent double-slashes exactly like the HLS parser
                         if (best_url.find("http") != 0) {
                             if (best_url.front() == '/') {
                                 size_t host_end = base_url.find('/', 8);
@@ -157,7 +181,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                         std::string v_host, v_path;
                         parse_url(best_url, v_host, v_path);
                         
-                        // FIX: Explicitly follow redirects for variant playlists
                         int v_redirects = 0;
                         while (v_redirects < 5) {
                             httplib::Client v_cli(v_host);
@@ -199,8 +222,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 
                 hls_playlist_text = rewrite_remote_hls(m3u8_body, base_url, my_proxy_port, hls_chunk_urls);
                 file_size = 1024; 
-            } else {
-                throw std::runtime_error("Failed to download m3u8 playlist");
             }
         } 
         else {
