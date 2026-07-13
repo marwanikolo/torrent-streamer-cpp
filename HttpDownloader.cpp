@@ -46,6 +46,15 @@ void HttpDownloader::update_playhead(size_t chunk_index) {
 }
 
 void HttpDownloader::worker_loop() {
+    // --- INITIALIZATION STEALTH: Wait 4 seconds before the background worker fires ---
+    // This allows the media player to boot and claim the initial network priority, 
+    // avoiding simultaneous connection attempts that trigger the HTTP 509 penalty.
+    int boot_wait = 0;
+    while (active_.load() && boot_wait < 40) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        boot_wait++;
+    }
+
     while (active_.load()) {
         // --- PRIORITY CHECK: Yield network to the proxy if requested ---
         if (cache_.is_network_preempted()) {

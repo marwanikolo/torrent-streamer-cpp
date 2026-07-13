@@ -79,7 +79,6 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
             std::string k_lower = it->first;
             std::transform(k_lower.begin(), k_lower.end(), k_lower.begin(), ::tolower);
             
-            // --- FIX: Strip out body-specific headers from the Burp file to prevent 400 Bad Requests on GETs ---
             if (k_lower == "range" || k_lower == "host" || k_lower == "connection" || 
                 k_lower == "accept-encoding" || k_lower == "content-length" || k_lower == "content-type") {
                 it = auth_headers.erase(it);
@@ -133,12 +132,10 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 ss << ifs.rdbuf();
                 m3u8_body = ss.str();
                 
-                // Fallback for absolute chunk URLs inside the local file
                 base_url = "http://localhost/"; 
             }
 
             if (!m3u8_body.empty()) {
-                // Only run variant extraction if we actually fetched a remote master playlist
                 if (m3u8_body.find("#EXT-X-STREAM-INF") != std::string::npos && (final_url.starts_with("http://") || final_url.starts_with("https://"))) {
                     std::println("[*] Master playlist detected. Searching for max bandwidth stream...");
                     uint64_t max_bw = 0;
@@ -225,6 +222,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
             }
         } 
         else {
+            // --- FIX: Replaced HEAD request with a single Range GET request to bypass CDN scraper rules ---
             while (redirects < 5) {
                 httplib::Client cli(current_host);
                 cli.enable_server_certificate_verification(false); 
@@ -232,7 +230,10 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 cli.set_read_timeout(5);
                 cli.set_follow_location(false); 
 
-                auto res = cli.Head(current_path.c_str(), auth_headers);
+                httplib::Headers req_headers = auth_headers; 
+                req_headers.emplace("Range", "bytes=0-0");
+
+                auto res = cli.Get(current_path.c_str(), req_headers);
                 
                 if (res) {
                     if (res->status >= 300 && res->status < 400 && res->has_header("Location")) {
@@ -242,45 +243,23 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                         std::println("[*] Following cross-domain redirect to: {}", current_host);
                         redirects++;
                         continue;
-                    } else if (res->status == 200 || res->status == 206) {
-                        if (res->has_header("Content-Length")) {
-                            file_size = std::stoll(res->get_header_value("Content-Length"));
-                        }
-                        break;
-                    } else {
-                        std::println("[*] Server returned HTTP {} for HEAD check.", res->status);
-                        break;
-                    }
-                } else {
-                    std::println("[-] HEAD check failed.");
-                    break;
-                }
-            }
-
-            if (file_size <= 0) {
-                std::println("[*] Attempting Range GET fallback...");
-                httplib::Client cli(current_host);
-                cli.enable_server_certificate_verification(false);
-                cli.set_connection_timeout(5);
-                cli.set_read_timeout(5);
-                
-                httplib::Headers req_headers = auth_headers; 
-                req_headers.emplace("Range", "bytes=0-0");
-                
-                auto get_res = cli.Get(current_path.c_str(), req_headers); 
-                
-                if (get_res) {
-                    if (get_res->status == 206 && get_res->has_header("Content-Range")) {
-                        std::string content_range = get_res->get_header_value("Content-Range");
+                    } else if (res->status == 206 && res->has_header("Content-Range")) {
+                        std::string content_range = res->get_header_value("Content-Range");
                         size_t slash_pos = content_range.find('/');
                         if (slash_pos != std::string::npos) {
                             file_size = std::stoll(content_range.substr(slash_pos + 1));
                         }
-                    } else if (get_res->status == 200 && get_res->has_header("Content-Length")) {
-                        file_size = std::stoll(get_res->get_header_value("Content-Length"));
+                        break;
+                    } else if (res->status == 200 && res->has_header("Content-Length")) {
+                        file_size = std::stoll(res->get_header_value("Content-Length"));
+                        break;
+                    } else {
+                        std::println("[*] Server returned HTTP {} for Range GET check.", res->status);
+                        break;
                     }
                 } else {
-                    std::println("[-] Range GET fallback failed due to network timeout.");
+                    std::println("[-] Range GET check failed due to network timeout.");
+                    break;
                 }
             }
 
