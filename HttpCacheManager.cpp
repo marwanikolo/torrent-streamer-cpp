@@ -11,6 +11,7 @@ HttpCacheManager::HttpCacheManager(const std::string& base_path, std::int64_t fi
     
     total_chunks_ = (file_size_ + chunk_size_ - 1) / chunk_size_;
     downloaded_chunks_.resize(total_chunks_, 0);
+    in_progress_chunks_.resize(total_chunks_, 0);
 }
 
 HttpCacheManager::~HttpCacheManager() {
@@ -100,6 +101,51 @@ void HttpCacheManager::set_chunk(size_t index) {
 
 size_t HttpCacheManager::get_total_chunks() const { return total_chunks_; }
 size_t HttpCacheManager::get_chunk_size() const { return chunk_size_; }
+
+// --- New Lock Mechanism Implementation ---
+
+bool HttpCacheManager::try_lock_chunk(size_t index) {
+    if (index >= total_chunks_) return false;
+    
+    // Do not lock if it's already fully downloaded
+    if (has_chunk(index)) return false;
+
+    std::lock_guard<std::mutex> lock(in_progress_mtx_);
+    if (in_progress_chunks_[index] == 1) {
+        return false; // Someone else is already downloading it
+    }
+    
+    in_progress_chunks_[index] = 1;
+    return true;
+}
+
+void HttpCacheManager::unlock_chunk(size_t index) {
+    if (index >= total_chunks_) return;
+    std::lock_guard<std::mutex> lock(in_progress_mtx_);
+    in_progress_chunks_[index] = 0;
+}
+
+bool HttpCacheManager::is_chunk_in_progress(size_t index) {
+    if (index >= total_chunks_) return false;
+    std::lock_guard<std::mutex> lock(in_progress_mtx_);
+    return in_progress_chunks_[index] == 1;
+}
+
+// --- Network Priority Mechanism Implementation ---
+
+void HttpCacheManager::request_network_priority() {
+    proxy_needs_network_.store(true);
+}
+
+void HttpCacheManager::release_network_priority() {
+    proxy_needs_network_.store(false);
+}
+
+bool HttpCacheManager::is_network_preempted() const {
+    return proxy_needs_network_.load();
+}
+
+// --- End New Lock Mechanism Implementation ---
 
 bool HttpCacheManager::write_data(std::int64_t offset, const char* data, size_t length) {
     std::lock_guard<std::mutex> lock(file_mtx_);

@@ -174,6 +174,20 @@ void HttpProxyServer::setup_routes() {
                         }
                     }
 
+                    // --- PRIORITY HANDOFF: The proxy needs data instantly. Claim the network. ---
+                    cache_.request_network_priority();
+
+                    // Sleep for 150ms. This ensures the background downloader's callback trips, 
+                    // returns false, and closes its TCP socket so we don't trigger the CDN's concurrent connection limit.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+                    // Now that the background downloader has yielded, lock the chunk.
+                    if (!cache_.try_lock_chunk(chunk_idx)) {
+                        cache_.release_network_priority();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        continue;
+                    }
+
                     std::int64_t req_end = std::min<std::int64_t>(current_byte + bytes_left - 1, chunk_end);
                     
                     httplib::Headers req_headers = extra_headers_;
@@ -186,6 +200,8 @@ void HttpProxyServer::setup_routes() {
                             if (response.status != 200 && response.status != 206) {
                                 write_debug_log(debug_, "[PROX] CRITICAL: CDN returned HTTP {}. Aborting stream to prevent cache poisoning.", response.status);
                                 std::println(stderr, "[-] Proxy Error: CDN returned HTTP {}", response.status);
+                                
+                                std::this_thread::sleep_for(std::chrono::seconds(3));
                                 abort_proxy = true;
                                 return false; 
                             }
@@ -196,6 +212,7 @@ void HttpProxyServer::setup_routes() {
                                 abort_proxy = true;
                                 return false; 
                             }
+                            // The proxy streams directly to the player, bypassing the read-cache deadlock entirely
                             sink.write(data, data_length);
                             cache_.write_data(current_byte, data, data_length);
                             current_byte += data_length;
@@ -204,8 +221,15 @@ void HttpProxyServer::setup_routes() {
                         }
                     );
 
+                    if (current_byte > chunk_end) {
+                        cache_.set_chunk(chunk_idx);
+                    }
+                    
+                    // --- RELEASE: Unlock the chunk and yield the network back to the background worker ---
+                    cache_.unlock_chunk(chunk_idx);
+                    cache_.release_network_priority(); 
+                    
                     if (abort_proxy || !web_res) return false;
-                    if (current_byte > chunk_end) cache_.set_chunk(chunk_idx);
                 }
                 return true; 
             }

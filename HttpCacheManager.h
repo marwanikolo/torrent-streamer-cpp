@@ -6,6 +6,7 @@
 #include <fstream>
 #include <cstdint>
 #include <filesystem>
+#include <atomic>
 
 class HttpCacheManager {
 public:
@@ -21,6 +22,16 @@ public:
     void set_chunk(size_t index);
     size_t get_total_chunks() const;
     size_t get_chunk_size() const;
+
+    // Download in-progress locking mechanism
+    bool try_lock_chunk(size_t index);
+    void unlock_chunk(size_t index);
+    bool is_chunk_in_progress(size_t index);
+
+    // Network Priority Mechanism
+    void request_network_priority();
+    void release_network_priority();
+    bool is_network_preempted() const;
 
     // Thread-safe disk I/O
     bool write_data(std::int64_t offset, const char* data, size_t length);
@@ -44,10 +55,15 @@ private:
     // Using uint8_t instead of vector<bool> because vector<bool> returns 
     // proxy objects in C++ which makes thread-safety very messy.
     std::vector<uint8_t> downloaded_chunks_;
+    std::vector<uint8_t> in_progress_chunks_;
 
-    // Two separate mutexes to prevent disk I/O from blocking quick state lookups
+    // Separate mutexes to prevent disk I/O, state lookups, and locks from blocking each other
     std::mutex state_mtx_;
     std::mutex file_mtx_;
+    std::mutex in_progress_mtx_;
+
+    // Atomic token to command the background thread to yield the network
+    std::atomic<bool> proxy_needs_network_{false};
 
     // The persistent file stream
     std::fstream file_stream_;

@@ -47,6 +47,12 @@ void HttpDownloader::update_playhead(size_t chunk_index) {
 
 void HttpDownloader::worker_loop() {
     while (active_.load()) {
+        // --- PRIORITY CHECK: Yield network to the proxy if requested ---
+        if (cache_.is_network_preempted()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
         size_t total = cache_.get_total_chunks();
         size_t target = std::string::npos;
         size_t current_playhead = playhead_.load();
@@ -79,6 +85,10 @@ void HttpDownloader::worker_loop() {
 }
 
 bool HttpDownloader::download_chunk(size_t chunk_index) {
+    if (!cache_.try_lock_chunk(chunk_index)) {
+        return false; 
+    }
+
     httplib::Client cli(host_);
     cli.set_connection_timeout(5);
     cli.set_read_timeout(5);
@@ -90,7 +100,6 @@ bool HttpDownloader::download_chunk(size_t chunk_index) {
         cache_.get_file_size() - 1
     );
 
-    // Merge the requested Range with the yt-dlp headers
     httplib::Headers req_headers = extra_headers_;
     req_headers.emplace("Range", std::format("bytes={}-{}", start_byte, end_byte));
 
@@ -99,7 +108,8 @@ bool HttpDownloader::download_chunk(size_t chunk_index) {
 
     auto res = cli.Get(path_.c_str(), req_headers,
         [&](const char *data, size_t data_length) {
-            if (!active_.load()) {
+            // --- INSTANT ABORT: Sever connection if proxy claims priority ---
+            if (!active_.load() || cache_.is_network_preempted()) {
                 download_aborted = true;
                 return false; 
             }
@@ -109,11 +119,13 @@ bool HttpDownloader::download_chunk(size_t chunk_index) {
         }
     );
 
+    bool success = false;
     if (res && (res->status == 206 || res->status == 200) && !download_aborted) {
         cache_.set_chunk(chunk_index);
         write_debug_log(true, "[BACK] Chunk {} perfectly cached.", chunk_index);
-        return true;
+        success = true;
     }
 
-    return false;
+    cache_.unlock_chunk(chunk_index);
+    return success;
 }
