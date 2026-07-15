@@ -271,19 +271,73 @@ void InteractiveShell::run_loop() {
             std::string payload = line.substr(4);
             AppConfig temp_config = config_; 
             
+            // --- FIX: Advanced Flag Parsing (Handles Quotes & Multiple Headers) ---
             auto extract_flag = [&](const std::string& flag, std::string& out) {
                 size_t pos = payload.find(flag);
                 if (pos != std::string::npos) {
-                    size_t val_start = payload.find_first_not_of(" \t=\"'", pos + flag.length());
+                    size_t val_start = payload.find_first_not_of(" \t=", pos + flag.length());
                     if (val_start != std::string::npos) {
-                        size_t val_end = payload.find_first_of(" \"'", val_start);
-                        if (val_end == std::string::npos) val_end = payload.length();
+                        char quote = payload[val_start];
+                        size_t val_end = std::string::npos;
+                        if (quote == '"' || quote == '\'') {
+                            val_start++; // Skip the opening quote
+                            val_end = payload.find(quote, val_start);
+                            if (val_end == std::string::npos) val_end = payload.length();
+                        } else {
+                            val_end = payload.find_first_of(" \t\r\n", val_start);
+                            if (val_end == std::string::npos) val_end = payload.length();
+                        }
                         out = payload.substr(val_start, val_end - val_start);
-                        payload.erase(pos, val_end - pos);
+                        size_t erase_end = (quote == '"' || quote == '\'') && val_end < payload.length() ? val_end + 1 : val_end;
+                        payload.erase(pos, erase_end - pos);
                     }
                 }
             };
 
+            // Specific extractor loop to grab ALL `-H` and `--header` occurrences
+            auto extract_headers = [&](const std::string& flag) {
+                size_t pos;
+                while ((pos = payload.find(flag)) != std::string::npos) {
+                    size_t val_start = payload.find_first_not_of(" \t=", pos + flag.length());
+                    if (val_start != std::string::npos) {
+                        char quote = payload[val_start];
+                        size_t val_end = std::string::npos;
+                        if (quote == '"' || quote == '\'') {
+                            val_start++;
+                            val_end = payload.find(quote, val_start);
+                            if (val_end == std::string::npos) val_end = payload.length();
+                        } else {
+                            val_end = payload.find_first_of(" \t\r\n", val_start);
+                            if (val_end == std::string::npos) val_end = payload.length();
+                        }
+                        
+                        std::string header_str = payload.substr(val_start, val_end - val_start);
+                        size_t colon_pos = header_str.find(':');
+                        
+                        // Break it into Key/Value pairs and store it
+                        if (colon_pos != std::string::npos) {
+                            std::string key = header_str.substr(0, colon_pos);
+                            std::string val = header_str.substr(colon_pos + 1);
+                            
+                            // Trim trailing/leading whitespaces
+                            key.erase(key.find_last_not_of(" \t") + 1);
+                            val.erase(0, val.find_first_not_of(" \t"));
+                            
+			    temp_config.custom_headers.emplace_back(key, val);
+                        }
+                        
+                        size_t erase_end = (quote == '"' || quote == '\'') && val_end < payload.length() ? val_end + 1 : val_end;
+                        payload.erase(pos, erase_end - pos);
+                    } else {
+                        // Malformed flag at the end of string, just drop the flag to prevent infinite loops
+                        payload.erase(pos, flag.length());
+                    }
+                }
+            };
+
+            // Order of execution ensures we strip out all metadata before assuming the rest is a URL
+            extract_headers("-H");
+            extract_headers("--header");
             extract_flag("--gofile-token", temp_config.gofile_token);
             extract_flag("--user-agent", temp_config.custom_user_agent);
             extract_flag("--referer", temp_config.custom_referer);

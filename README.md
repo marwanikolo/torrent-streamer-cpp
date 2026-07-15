@@ -12,7 +12,7 @@ Designed as a true multi-threaded background daemon, it features an interactive 
 ## ✨ Killer Features
 
 * **Zero-Copy Memory Mapping (`mmap`):** Bypasses expensive standard C++ file stream (`ifstream`) syscalls. The HTTP frontend serves chunks directly from the Linux Kernel's page cache, utilizing `madvise(MADV_SEQUENTIAL)` to aggressively free RAM during massive (50GB+) ISO streaming.
-* **Autonomous Network Sniffer (TLS Decryption):** Natively intercepts live network traffic by tapping into the `SSLKEYLOGFILE` environment variable to decrypt HTTPS streams on the fly. Automatically extracts ephemeral cookies, tokens, and URL signatures from modern HTTP/2 and HTTP/3 (QUIC) traffic.
+* **Autonomous Network Sniffer (TLS Decryption):** Natively intercepts live network traffic by tapping into the `SSLKEYLOGFILE` environment variable to decrypt HTTPS streams on the fly. Automatically extracts ephemeral cookies, tokens, and URL signatures from modern HTTP/2, HTTP/3 (QUIC), and gracefully handles **HTTP/1.1 large-file downgrades**.
 * **Universal Scriptable Media Proxy:** Bypasses aggressive CDN hotlink protections (like Pixeldrain or Gofile) using arbitrary HTTP header injection. Automatically follows cross-domain HTTP 302 redirects to locate physical storage nodes. Dynamically strips carriage returns (`\r\n`) to evade Nginx tarpit connection drops.
 * **Native HLS & m3u8 Proxy Rewriting:** Instantly bypasses CDN hotlink and CORS protections on HTTP Live Streams. The daemon intercepts remote `.m3u8` master playlists, automatically negotiates the maximum bandwidth variant, and rewrites the internal chunk URLs to securely route `.ts` media segments through the local C++ caching server.
 * **Burp Suite & DevTools Integration:** Defeat complex, token-based authentication (like Cloudflare Turnstile or reCAPTCHA headers) by simply right-clicking a network request in your browser or Burp Suite, copying it to a text file, and passing it via the `-b` flag. The daemon automatically parses and injects the entire raw HTTP state into the proxy engine.
@@ -46,6 +46,9 @@ The sniffer utilizes a background worker loop and pipes `tshark` output into a t
 
 ### 6. Algorithmic Telemetry Profiling (O(N) Scaling)
 The internal telemetry and alert loop is rigorously profiled to eliminate CPU cache thrashing. By utilizing `std::partial_sort` over standard sorting algorithms (reducing time complexity from O(N log N) to O(N log k)) and strictly pre-allocating heap capacities, the daemon maintains a flat memory footprint and near-zero CPU overhead, even when tracking tens of thousands of pieces in real-time across massive 50GB+ torrent swarms.
+
+### 7. Adaptive TCP Backpressure (Anti-Leech Bypass)
+Premium file hosts (like Keep2Share) strictly ban multi-threaded chunking and bounded `Range` requests via `HTTP 509 Bandwidth Limit Exceeded` firewalls. To bypass this, the Direct HTTP Engine uses an **Open-Ended Continuous Pipeline**. It opens a single, naked `GET` or open-ended `Range` request and binds the C++ memory sink directly to the media player. If MPV's buffer fills up, the C++ `httplib::DataSink` naturally pauses, utilizing native TCP window scaling to throttle the CDN download organically without dropping the socket or triggering leeching penalties.
 
 ## 🛠️ Dependencies
 
@@ -88,7 +91,7 @@ Once the background servers initialize, you will be dropped into the interactive
 * `add <link>`: Paste a magnet link, local `.torrent` path, or HTTP link. Supports inline dynamic flag overrides per-command (e.g., `add <link> --referer <url>`).
 * `yt`: Enters the interactive `yt-dlp` sub-shell. Use `-J` or `--dump-json` to extract format lists and select specific video/audio streams to proxy.
 * `sniff start`: Starts the native network interception queue via `tshark`.
-* `sniff list`: Displays captured media streams alongside their capture timestamps.
+* `sniff list`: Launches the **Interactive Media Dashboard (TUI)**. Features live terminal raw-mode rendering, smart color-coding (auto-dimming tracking pixels vs. highlighting 1MB+ video payloads), precise file size/MIME probing, and `[Space]` multi-selection to spawn synchronized player windows.
 * `sniff play <idx>`: Plays an intercepted stream. Supports multi-target launching (e.g., `sniff play 0,1`) to actively merge split video and audio.
 * `sniff stop / clear`: Stops the background sniffer process or clears the interception queue.
 * `list`: Displays a real-time list of all active BitTorrent and Direct Web streams.
@@ -127,7 +130,7 @@ The engine uses a **Module Tagging System** so you can easily `grep` for specifi
 tail -f streamer_debug.log
 
 # Filter ONLY for player seeks and proxy routing
-grep -E "\[SEEK\]|\[PROX\]" streamer_debug.log
+grep -E "\[SEEK\]|\\[PROX\\]" streamer_debug.log
 ```
 
 ### Command Line Arguments
