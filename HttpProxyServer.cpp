@@ -65,11 +65,22 @@ void HttpProxyServer::setup_routes() {
             res.set_content(hls_playlist_text_, "application/vnd.apple.mpegurl");
         });
 
-        std::string chunk_route = R"(/chunk/(\d+))";
+        // Regex now optionally matches the file extension (e.g., .ts or .m4s)
+        std::string chunk_route = R"(/chunk/(\d+)(?:\.([a-zA-Z0-9]+))?)";
         svr_.Get(chunk_route, [this](const httplib::Request& req, httplib::Response& res) {
+            
+            // Bypass cpp-httplib's internal auto-slicer
+            const_cast<httplib::Request&>(req).ranges.clear();
+
             int chunk_index = 0;
+            std::string ext = "ts"; // Default fallback
+            
             try {
                 chunk_index = std::stoi(req.matches[1]);
+                // Safely extract the extension if it exists in the regex match
+                if (req.matches.size() > 2 && req.matches[2].matched) {
+                    ext = req.matches[2].str();
+                }
             } catch (...) {
                 res.status = 404;
                 return;
@@ -80,7 +91,11 @@ void HttpProxyServer::setup_routes() {
                 return;
             }
 
-            std::string chunk_file_path = std::format("{}/chunk_{}.ts", hls_save_dir_, chunk_index);
+            // Set MIME type dynamically based on the extension
+            std::string mime_type = (ext == "m4s" || ext == "mp4") ? "video/mp4" : "video/MP2T";
+            
+            // Use the captured extension for the saved file path
+            std::string chunk_file_path = std::format("{}/chunk_{}.{}", hls_save_dir_, chunk_index, ext);
 
             std::error_code ec;
             if (std::filesystem::exists(chunk_file_path, ec)) {
@@ -92,7 +107,19 @@ void HttpProxyServer::setup_routes() {
                     
                     if (ifs.read(buffer.data(), size)) {
                         write_debug_log(debug_, "[PROX] HLS Cache HIT: Serving chunk {} from disk.", chunk_index);
-                        res.set_content(buffer, "video/MP2T");
+                        
+                        // Manually spoof the 206 response for the player
+                        if (req.has_header("Range")) {
+                            res.status = 206; 
+                            std::string range_val = req.get_header_value("Range");
+                            if (range_val.starts_with("bytes=")) {
+                                std::string range_range = range_val.substr(6);
+                                res.set_header("Content-Range", std::format("bytes {}/*", range_range));
+                            }
+                        }
+                        
+                        // Use dynamic MIME type on Cache Hit
+                        res.set_content(buffer, mime_type.c_str());
                         return; 
                     }
                 }
@@ -106,11 +133,17 @@ void HttpProxyServer::setup_routes() {
             c_host = target_chunk_url.substr(0, path_start);
             c_path = target_chunk_url.substr(path_start);
 
+            // Forward the Range header to the CDN
+            httplib::Headers fetch_headers = extra_headers_;
+            if (req.has_header("Range")) {
+                fetch_headers.emplace("Range", req.get_header_value("Range"));
+            }
+
             httplib::Client cli(c_host);
             cli.set_follow_location(true);
             cli.enable_server_certificate_verification(false); 
             
-            auto web_res = cli.Get(c_path.c_str(), extra_headers_);
+            auto web_res = cli.Get(c_path.c_str(), fetch_headers);
 
             if (web_res && (web_res->status == 200 || web_res->status == 206)) {
                 std::ofstream ofs(chunk_file_path, std::ios::binary);
@@ -118,7 +151,18 @@ void HttpProxyServer::setup_routes() {
                     ofs.write(web_res->body.data(), web_res->body.size());
                 }
                 
-                res.set_content(web_res->body, "video/MP2T");
+                // Forward the partial content status and upstream content type
+                res.status = web_res->status;
+                if (web_res->has_header("Content-Range")) {
+                    res.set_header("Content-Range", web_res->get_header_value("Content-Range"));
+                }
+                
+                // Fallback to dynamic MIME type if CDN doesn't provide Content-Type
+                std::string content_type = web_res->has_header("Content-Type") 
+                                           ? web_res->get_header_value("Content-Type") 
+                                           : mime_type;
+                
+                res.set_content(web_res->body, content_type.c_str());
             } else {
                 write_debug_log(debug_, "[PROX] Failed to fetch CDN chunk {}. Status: {}", chunk_index, web_res ? web_res->status : 0);
                 res.status = 404;

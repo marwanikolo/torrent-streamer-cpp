@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>
 
 inline uint16_t read_be16(std::ifstream& f) {
     unsigned char buf[2];
@@ -150,31 +151,89 @@ std::string generate_hls(const std::vector<MapEntry>& master_index, int64_t tota
 
 // --- NEW: Internet HLS Proxy Rewriter ---
 std::string rewrite_remote_hls(const std::string& raw_m3u8, const std::string& base_url, int port, std::vector<std::string>& out_chunk_urls) {
-    std::istringstream stream(raw_m3u8);
+    // 1. Safely normalize all line endings (\r\n or \r) to standard Unix (\n)
+    std::string normalized_m3u8 = raw_m3u8;
+    size_t pos = 0;
+    while ((pos = normalized_m3u8.find("\r\n", pos)) != std::string::npos) {
+        normalized_m3u8.replace(pos, 2, "\n");
+    }
+    std::replace(normalized_m3u8.begin(), normalized_m3u8.end(), '\r', '\n');
+
+    std::istringstream stream(normalized_m3u8);
     std::ostringstream rewritten;
     std::string line;
     int chunk_index = 0;
 
-    while (std::getline(stream, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+    // Helper lambda to safely build full CDN URLs
+    auto resolve_url = [&](std::string full_url) {
+        if (full_url.find("http") != 0) {
+            if (full_url.front() == '/') {
+                size_t host_end = base_url.find('/', 8); // Skip https://
+                if (host_end != std::string::npos) {
+                    full_url = base_url.substr(0, host_end) + full_url;
+                }
+            } else {
+                full_url = base_url + full_url;
+            }
+        }
+        return full_url;
+    };
 
-        if (line.empty() || line[0] == '#') {
-            rewritten << line << "\n";
-        } else {
-            std::string full_url = line;
-            // Handle relative CDN paths securely
-            if (full_url.find("http") != 0) {
-                if (full_url.front() == '/') {
-                    size_t host_end = base_url.find('/', 8); // Skip https://
-                    if (host_end != std::string::npos) {
-                        full_url = base_url.substr(0, host_end) + full_url;
-                    }
-                } else {
-                    full_url = base_url + full_url;
+    // Helper lambda to extract the file extension
+    auto get_extension = [](const std::string& url) {
+        size_t query_pos = url.find('?');
+        std::string path = (query_pos != std::string::npos) ? url.substr(0, query_pos) : url;
+        size_t slash_pos = path.find_last_of('/');
+        std::string filename = (slash_pos != std::string::npos) ? path.substr(slash_pos + 1) : path;
+        size_t dot_pos = filename.find_last_of('.');
+        if (dot_pos != std::string::npos && dot_pos != 0) {
+            return filename.substr(dot_pos); // e.g., ".m4s" or ".ts"
+        }
+        return std::string(".ts"); // Fallback for standard MPEG-TS
+    };
+
+    while (std::getline(stream, line)) {
+        if (line.empty()) {
+            rewritten << "\n";
+            continue;
+        }
+
+        // Intercept EXT-X-MAP to rewrite the initialization chunk URI
+        if (line.starts_with("#EXT-X-MAP:")) {
+            size_t uri_pos = line.find("URI=\"");
+            if (uri_pos != std::string::npos) {
+                size_t start = uri_pos + 5;
+                size_t end = line.find("\"", start);
+                
+                if (end != std::string::npos) {
+                    std::string raw_uri = line.substr(start, end - start);
+                    std::string full_url = resolve_url(raw_uri);
+                    
+                    // Register the chunk with the proxy
+                    out_chunk_urls.push_back(full_url);
+                    
+                    // Inject our local proxy route with the dynamically extracted extension
+                    std::string ext = get_extension(full_url);
+                    std::string new_uri = "http://localhost:" + std::to_string(port) + "/chunk/" + std::to_string(chunk_index) + ext;
+                    rewritten << line.substr(0, start) << new_uri << line.substr(end) << "\n";
+                    
+                    chunk_index++;
+                    continue; 
                 }
             }
+        }
+
+        // Standard tags are passed through safely
+        if (line[0] == '#') {
+            rewritten << line << "\n";
+        } 
+        // Standard video segments are captured and replaced
+        else {
+            std::string full_url = resolve_url(line);
             out_chunk_urls.push_back(full_url);
-            rewritten << "http://localhost:" << port << "/chunk/" << chunk_index << "\n";
+            
+            std::string ext = get_extension(full_url);
+            rewritten << "http://localhost:" << port << "/chunk/" << chunk_index << ext << "\n";
             chunk_index++;
         }
     }

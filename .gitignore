@@ -21,6 +21,9 @@ streamer_debug.log
 *.jpg
 *.txt
 *.burp
+*.srt
+*.diff
+*.log
 .aider*
 opencode.json
 .vscode/
