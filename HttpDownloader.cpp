@@ -46,9 +46,6 @@ void HttpDownloader::update_playhead(size_t chunk_index) {
 }
 
 void HttpDownloader::worker_loop() {
-    // --- INITIALIZATION STEALTH: Wait 4 seconds before the background worker fires ---
-    // This allows the media player to boot and claim the initial network priority, 
-    // avoiding simultaneous connection attempts that trigger the HTTP 509 penalty.
     int boot_wait = 0;
     while (active_.load() && boot_wait < 40) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -56,7 +53,6 @@ void HttpDownloader::worker_loop() {
     }
 
     while (active_.load()) {
-        // --- PRIORITY CHECK: Yield network to the proxy if requested ---
         if (cache_.is_network_preempted()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
@@ -104,37 +100,46 @@ bool HttpDownloader::download_chunk(size_t chunk_index) {
     cli.set_follow_location(true);
 
     std::int64_t start_byte = chunk_index * cache_.get_chunk_size();
-    std::int64_t end_byte = std::min<std::int64_t>(
-        start_byte + cache_.get_chunk_size() - 1, 
-        cache_.get_file_size() - 1
-    );
 
     httplib::Headers req_headers = extra_headers_;
-    req_headers.emplace("Range", std::format("bytes={}-{}", start_byte, end_byte));
+    
+    // --- THE FIX: Never send a Range header if requesting byte 0 ---
+    if (start_byte > 0) {
+        req_headers.emplace("Range", std::format("bytes={}-", start_byte));
+    }
 
     std::int64_t current_offset = start_byte;
     bool download_aborted = false;
 
     auto res = cli.Get(path_.c_str(), req_headers,
         [&](const char *data, size_t data_length) {
-            // --- INSTANT ABORT: Sever connection if proxy claims priority ---
             if (!active_.load() || cache_.is_network_preempted()) {
                 download_aborted = true;
                 return false; 
             }
+            
             cache_.write_data(current_offset, data, data_length);
+            
+            size_t old_chunk = current_offset / cache_.get_chunk_size();
+            size_t new_chunk = (current_offset + data_length) / cache_.get_chunk_size();
+            
+            if (new_chunk > old_chunk) {
+                cache_.set_chunk(old_chunk);
+                write_debug_log(true, "[BACK] Chunk {} perfectly cached.", old_chunk);
+            }
+
             current_offset += data_length;
+            
+            if (current_offset >= cache_.get_file_size()) return false;
+            
             return true;
         }
     );
 
-    bool success = false;
-    if (res && (res->status == 206 || res->status == 200) && !download_aborted) {
-        cache_.set_chunk(chunk_index);
-        write_debug_log(true, "[BACK] Chunk {} perfectly cached.", chunk_index);
-        success = true;
+    if (current_offset >= cache_.get_file_size() && !download_aborted) {
+        cache_.set_chunk(current_offset / cache_.get_chunk_size());
     }
 
     cache_.unlock_chunk(chunk_index);
-    return success;
+    return current_offset > start_byte;
 }

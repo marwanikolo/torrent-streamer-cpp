@@ -1,5 +1,4 @@
 -- scripts/daemon_sniffer.lua
--- Native Wireshark Lua Dissector for the C++ StreamerDaemon
 
 local filter = 'http2.header.name == ":path" or http.request.uri or http3.header.header.name == ":path"'
 local tap = Listener.new("frame", filter)
@@ -11,6 +10,12 @@ local f_h3_name = Field.new("http3.header.header.name")
 local f_h3_val  = Field.new("http3.headers.header.value")
 local f_h1_uri  = Field.new("http.request.uri")
 local f_h1_host = Field.new("http.host")
+
+-- --- NEW: HTTP/1.1 Specific Header Extractors ---
+local f_h1_cookie = Field.new("http.cookie")
+local f_h1_ua     = Field.new("http.user_agent")
+local f_h1_ref    = Field.new("http.referer")
+local f_h1_auth   = Field.new("http.authorization")
 
 -- Universal Media Keywords
 local keywords = {
@@ -57,6 +62,19 @@ function tap.packet(pinfo, tvb, tapinfo)
         if h1_uri and h1_host then
             path = tostring(h1_uri.value)
             authority = tostring(h1_host.value)
+            
+            -- --- FIX: Actually extract the auth headers for HTTP/1.1 streams! ---
+            local h1_c = f_h1_cookie()
+            if h1_c then headers["cookie"] = tostring(h1_c.value) end
+            
+            local h1_ua = f_h1_ua()
+            if h1_ua then headers["user-agent"] = tostring(h1_ua.value) end
+            
+            local h1_ref = f_h1_ref()
+            if h1_ref then headers["referer"] = tostring(h1_ref.value) end
+            
+            local h1_auth = f_h1_auth()
+            if h1_auth then headers["authorization"] = tostring(h1_auth.value) end
         end
     end
 

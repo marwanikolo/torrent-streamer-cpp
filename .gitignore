@@ -25,6 +25,7 @@ streamer_debug.log
 *.diff
 *.log
 .aider*
+*sh
 opencode.json
 .vscode/
 compile_commands.json

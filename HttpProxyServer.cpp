@@ -65,19 +65,16 @@ void HttpProxyServer::setup_routes() {
             res.set_content(hls_playlist_text_, "application/vnd.apple.mpegurl");
         });
 
-        // Regex now optionally matches the file extension (e.g., .ts or .m4s)
         std::string chunk_route = R"(/chunk/(\d+)(?:\.([a-zA-Z0-9]+))?)";
         svr_.Get(chunk_route, [this](const httplib::Request& req, httplib::Response& res) {
             
-            // Bypass cpp-httplib's internal auto-slicer
             const_cast<httplib::Request&>(req).ranges.clear();
 
             int chunk_index = 0;
-            std::string ext = "ts"; // Default fallback
+            std::string ext = "ts"; 
             
             try {
                 chunk_index = std::stoi(req.matches[1]);
-                // Safely extract the extension if it exists in the regex match
                 if (req.matches.size() > 2 && req.matches[2].matched) {
                     ext = req.matches[2].str();
                 }
@@ -91,10 +88,7 @@ void HttpProxyServer::setup_routes() {
                 return;
             }
 
-            // Set MIME type dynamically based on the extension
             std::string mime_type = (ext == "m4s" || ext == "mp4") ? "video/mp4" : "video/MP2T";
-            
-            // Use the captured extension for the saved file path
             std::string chunk_file_path = std::format("{}/chunk_{}.{}", hls_save_dir_, chunk_index, ext);
 
             std::error_code ec;
@@ -108,7 +102,6 @@ void HttpProxyServer::setup_routes() {
                     if (ifs.read(buffer.data(), size)) {
                         write_debug_log(debug_, "[PROX] HLS Cache HIT: Serving chunk {} from disk.", chunk_index);
                         
-                        // Manually spoof the 206 response for the player
                         if (req.has_header("Range")) {
                             res.status = 206; 
                             std::string range_val = req.get_header_value("Range");
@@ -118,7 +111,6 @@ void HttpProxyServer::setup_routes() {
                             }
                         }
                         
-                        // Use dynamic MIME type on Cache Hit
                         res.set_content(buffer, mime_type.c_str());
                         return; 
                     }
@@ -133,7 +125,6 @@ void HttpProxyServer::setup_routes() {
             c_host = target_chunk_url.substr(0, path_start);
             c_path = target_chunk_url.substr(path_start);
 
-            // Forward the Range header to the CDN
             httplib::Headers fetch_headers = extra_headers_;
             if (req.has_header("Range")) {
                 fetch_headers.emplace("Range", req.get_header_value("Range"));
@@ -151,13 +142,11 @@ void HttpProxyServer::setup_routes() {
                     ofs.write(web_res->body.data(), web_res->body.size());
                 }
                 
-                // Forward the partial content status and upstream content type
                 res.status = web_res->status;
                 if (web_res->has_header("Content-Range")) {
                     res.set_header("Content-Range", web_res->get_header_value("Content-Range"));
                 }
                 
-                // Fallback to dynamic MIME type if CDN doesn't provide Content-Type
                 std::string content_type = web_res->has_header("Content-Type") 
                                            ? web_res->get_header_value("Content-Type") 
                                            : mime_type;
@@ -194,86 +183,90 @@ void HttpProxyServer::setup_routes() {
                 size_t start_chunk = current_byte / cache_.get_chunk_size();
                 if (current_byte < file_size - (5 * 1024 * 1024)) downloader_.update_playhead(start_chunk);
 
-                httplib::Client cli(host_);
-                cli.set_keep_alive(true);
-                cli.set_follow_location(true);
-                cli.enable_server_certificate_verification(false);
-
                 while (bytes_left > 0) {
                     if (is_shutting_down_ || my_id < current_request_id_) return false;
 
                     size_t chunk_idx = current_byte / cache_.get_chunk_size();
-                    std::int64_t chunk_end = std::min<std::int64_t>(((chunk_idx + 1) * cache_.get_chunk_size()) - 1, file_size - 1);
 
                     if (cache_.has_chunk(chunk_idx)) {
+                        std::int64_t chunk_end = std::min<std::int64_t>(((chunk_idx + 1) * cache_.get_chunk_size()) - 1, file_size - 1);
                         std::int64_t read_len = std::min<std::int64_t>(bytes_left, chunk_end - current_byte + 1);
                         std::vector<char> buf(read_len);
                         
                         size_t bytes_read = cache_.read_data(current_byte, buf.data(), read_len);
                         if (bytes_read > 0) {
-                            sink.write(buf.data(), bytes_read);
+                            if (!sink.write(buf.data(), bytes_read)) return false; 
                             current_byte += bytes_read;
                             bytes_left -= bytes_read;
                             continue;
                         }
                     }
 
-                    // --- PRIORITY HANDOFF: The proxy needs data instantly. Claim the network. ---
                     cache_.request_network_priority();
-
-                    // Sleep for 150ms. This ensures the background downloader's callback trips, 
-                    // returns false, and closes its TCP socket so we don't trigger the CDN's concurrent connection limit.
                     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
-                    // Now that the background downloader has yielded, lock the chunk.
-                    if (!cache_.try_lock_chunk(chunk_idx)) {
-                        cache_.release_network_priority();
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                        continue;
-                    }
+                    httplib::Client cli(host_);
+                    cli.set_keep_alive(true);
+                    cli.set_follow_location(true);
+                    cli.enable_server_certificate_verification(false);
 
-                    std::int64_t req_end = std::min<std::int64_t>(current_byte + bytes_left - 1, chunk_end);
-                    
                     httplib::Headers req_headers = extra_headers_;
-                    req_headers.emplace("Range", std::format("bytes={}-{}", current_byte, req_end));
                     
-                    bool abort_proxy = false;
+                    // --- THE FIX: Never send a Range header if requesting byte 0 ---
+                    if (current_byte > 0) {
+                        req_headers.emplace("Range", std::format("bytes={}-", current_byte));
+                    }
+                    
+                    bool mpv_disconnected = false;
                     
                     auto web_res = cli.Get(path_.c_str(), req_headers, 
                         [&](const httplib::Response& response) {
                             if (response.status != 200 && response.status != 206) {
-                                write_debug_log(debug_, "[PROX] CRITICAL: CDN returned HTTP {}. Aborting stream to prevent cache poisoning.", response.status);
+                                write_debug_log(debug_, "[PROX] CRITICAL: CDN returned HTTP {}. Aborting stream.", response.status);
                                 std::println(stderr, "[-] Proxy Error: CDN returned HTTP {}", response.status);
-                                
-                                std::this_thread::sleep_for(std::chrono::seconds(3));
-                                abort_proxy = true;
                                 return false; 
                             }
                             return true;
                         },
                         [&](const char *data, size_t data_length) {
                             if (is_shutting_down_ || my_id < current_request_id_) {
-                                abort_proxy = true;
                                 return false; 
                             }
-                            // The proxy streams directly to the player, bypassing the read-cache deadlock entirely
-                            sink.write(data, data_length);
-                            cache_.write_data(current_byte, data, data_length);
-                            current_byte += data_length;
-                            bytes_left -= data_length;
+                            
+                            size_t bytes_to_process = std::min<size_t>(data_length, (size_t)bytes_left);
+                            
+                            if (!sink.write(data, bytes_to_process)) {
+                                mpv_disconnected = true;
+                                return false; 
+                            }
+
+                            cache_.write_data(current_byte, data, bytes_to_process);
+                            
+                            size_t old_chunk = current_byte / cache_.get_chunk_size();
+                            size_t new_chunk = (current_byte + bytes_to_process) / cache_.get_chunk_size();
+                            if (new_chunk > old_chunk) {
+                                cache_.set_chunk(old_chunk);
+                            }
+                            
+                            current_byte += bytes_to_process;
+                            bytes_left -= bytes_to_process;
+                            
+                            if (bytes_left <= 0) return false; 
                             return true;
                         }
                     );
-
-                    if (current_byte > chunk_end) {
-                        cache_.set_chunk(chunk_idx);
-                    }
                     
-                    // --- RELEASE: Unlock the chunk and yield the network back to the background worker ---
-                    cache_.unlock_chunk(chunk_idx);
+                    if (current_byte >= file_size) {
+                        cache_.set_chunk(current_byte / cache_.get_chunk_size());
+                    }
+
                     cache_.release_network_priority(); 
                     
-                    if (abort_proxy || !web_res) return false;
+                    if (mpv_disconnected) return false; 
+                    
+                    if (!web_res || web_res->status == 509) {
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                    }
                 }
                 return true; 
             }

@@ -79,11 +79,24 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
             std::string k_lower = it->first;
             std::transform(k_lower.begin(), k_lower.end(), k_lower.begin(), ::tolower);
             
+            // --- FIX: Added if-range, if-match, and if-none-match to the strip list ---
             if (k_lower == "range" || k_lower == "host" || k_lower == "connection" || 
-                k_lower == "accept-encoding" || k_lower == "content-length" || k_lower == "content-type") {
+                k_lower == "accept-encoding" || k_lower == "content-length" || k_lower == "content-type" ||
+                k_lower == "if-range" || k_lower == "if-match" || k_lower == "if-none-match") {
                 it = auth_headers.erase(it);
             } else {
                 ++it;
+            }
+        }
+
+        std::println("[*] Outbound Headers for this stream:");
+        if (auth_headers.empty()) {
+            std::println("  => [WARNING] NO HEADERS FOUND! Request is naked.");
+        } else {
+            for (const auto& [k, v] : auth_headers) {
+                std::string display_val = v.length() > 75 ? v.substr(0, 75) + "... [truncated]" : v;
+                std::println("  => {}: {}", k, display_val);
+                write_debug_log(config.debug_mode, "[PROX] Header -> {}: {}", k, v);
             }
         }
 
@@ -106,10 +119,43 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         bool is_hls = final_url.find(".m3u8") != std::string::npos;
         std::string hls_playlist_text;
         std::vector<std::string> hls_chunk_urls;
+
+        // --- RELOCATED CACHE LOGIC: Check local disk BEFORE probing the network ---
+        std::string base_url = final_url;
+        size_t query_pos = base_url.find('?');
+        if (query_pos != std::string::npos) base_url = base_url.substr(0, query_pos);
+
+        std::hash<std::string> hasher;
+        std::string stream_id = prefix + "_" + std::to_string(hasher(base_url));
+
+        std::string safe_name = base_url;
+        std::replace_if(safe_name.begin(), safe_name.end(), [](char c) { return !std::isalnum(c); }, '_');
+        if (safe_name.length() > 50) safe_name = safe_name.substr(safe_name.length() - 50);
+
+        std::string cache_path;
+        std::string hls_save_dir;
+
+        if (is_hls) {
+            hls_save_dir = config.save_dir + "/" + prefix + "_" + safe_name + "_hls";
+            std::error_code ec;
+            std::filesystem::create_directories(hls_save_dir, ec);
+            cache_path = hls_save_dir + "/dummy_cache.bin"; 
+        } else {
+            cache_path = config.save_dir + "/" + prefix + "_" + safe_name + ".bin";
+            
+            std::error_code ec;
+            if (std::filesystem::exists(cache_path, ec)) {
+                std::int64_t local_size = std::filesystem::file_size(cache_path, ec);
+                if (!ec && local_size > 1024) {
+                    file_size = local_size;
+                    std::println("[*] Valid local cache found ({} bytes). Skipping remote size probe to preserve connection slots.", file_size);
+                }
+            }
+        }
         
         if (is_hls) {
             std::string m3u8_body;
-            std::string base_url;
+            std::string hls_base_url;
             
             if (final_url.starts_with("http://") || final_url.starts_with("https://")) {
                 std::println("[*] Detected Remote HLS Playlist. Injecting Remote Rewriter...");
@@ -119,7 +165,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
 
                 if (res && res->status == 200) {
                     m3u8_body = res->body;
-                    base_url = final_url.substr(0, final_url.find_last_of('/') + 1);
+                    hls_base_url = final_url.substr(0, final_url.find_last_of('/') + 1);
                 } else {
                     throw std::runtime_error("Failed to download remote m3u8 playlist");
                 }
@@ -132,7 +178,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 ss << ifs.rdbuf();
                 m3u8_body = ss.str();
                 
-                base_url = "http://localhost/"; 
+                hls_base_url = "http://localhost/"; 
             }
 
             if (!m3u8_body.empty()) {
@@ -163,14 +209,14 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                     if (!best_url.empty()) {
                         if (best_url.find("http") != 0) {
                             if (best_url.front() == '/') {
-                                size_t host_end = base_url.find('/', 8);
+                                size_t host_end = hls_base_url.find('/', 8);
                                 if (host_end != std::string::npos) {
-                                    best_url = base_url.substr(0, host_end) + best_url;
+                                    best_url = hls_base_url.substr(0, host_end) + best_url;
                                 } else {
-                                    best_url = base_url + best_url;
+                                    best_url = hls_base_url + best_url;
                                 }
                             } else {
-                                best_url = base_url + best_url;
+                                best_url = hls_base_url + best_url;
                             }
                         }
                         
@@ -192,10 +238,10 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                                     std::string loc = v_res->get_header_value("Location");
                                     if (loc.starts_with("http")) best_url = loc;
                                     else if (loc.starts_with("/")) best_url = v_host + loc;
-                                    else best_url = base_url + loc;
+                                    else best_url = hls_base_url + loc;
                                     
                                     parse_url(best_url, v_host, v_path);
-                                    base_url = best_url.substr(0, best_url.find_last_of('/') + 1);
+                                    hls_base_url = best_url.substr(0, best_url.find_last_of('/') + 1);
                                     std::println("[*] Following redirect to variant host: {}", v_host);
                                     v_redirects++;
                                     continue;
@@ -203,7 +249,7 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                                 } else if (v_res->status == 200) {
                                     std::println("[*] Successfully acquired highest quality variant playlist.");
                                     m3u8_body = v_res->body;
-                                    base_url = best_url.substr(0, best_url.find_last_of('/') + 1);
+                                    hls_base_url = best_url.substr(0, best_url.find_last_of('/') + 1);
                                     break;
                                 } else {
                                     std::println(stderr, "[-] CDN rejected variant request. Status: {}", v_res->status);
@@ -217,86 +263,56 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                     }
                 }
                 
-                hls_playlist_text = rewrite_remote_hls(m3u8_body, base_url, my_proxy_port, hls_chunk_urls);
+                hls_playlist_text = rewrite_remote_hls(m3u8_body, hls_base_url, my_proxy_port, hls_chunk_urls);
                 file_size = 1024; 
             }
         } 
         else {
-            // --- FIX: Replaced HEAD request with a single Range GET request to bypass CDN scraper rules ---
-            while (redirects < 5) {
-                httplib::Client cli(current_host);
-                cli.enable_server_certificate_verification(false); 
-                cli.set_connection_timeout(5);
-                cli.set_read_timeout(5);
-                cli.set_follow_location(false); 
+            // --- FIX: Only probe the network if the local cache didn't give us the size ---
+            if (file_size == 0) {
+                while (redirects < 5) {
+                    httplib::Client cli(current_host);
+                    cli.enable_server_certificate_verification(false); 
+                    cli.set_connection_timeout(5);
+                    cli.set_read_timeout(5);
+                    cli.set_follow_location(false); 
 
-                httplib::Headers req_headers = auth_headers; 
-                req_headers.emplace("Range", "bytes=0-0");
+                    httplib::Headers req_headers = auth_headers; 
+                    req_headers.emplace("Range", "bytes=0-0");
 
-                auto res = cli.Get(current_path.c_str(), req_headers);
-                
-                if (res) {
-                    if (res->status >= 300 && res->status < 400 && res->has_header("Location")) {
-                        std::string loc = res->get_header_value("Location");
-                        final_url = loc.starts_with("http") ? loc : current_host + loc;
-                        parse_url(final_url, current_host, current_path);
-                        std::println("[*] Following cross-domain redirect to: {}", current_host);
-                        redirects++;
-                        continue;
-                    } else if (res->status == 206 && res->has_header("Content-Range")) {
-                        std::string content_range = res->get_header_value("Content-Range");
-                        size_t slash_pos = content_range.find('/');
-                        if (slash_pos != std::string::npos) {
-                            file_size = std::stoll(content_range.substr(slash_pos + 1));
+                    auto res = cli.Get(current_path.c_str(), req_headers);
+                    
+                    if (res) {
+                        if (res->status >= 300 && res->status < 400 && res->has_header("Location")) {
+                            std::string loc = res->get_header_value("Location");
+                            final_url = loc.starts_with("http") ? loc : current_host + loc;
+                            parse_url(final_url, current_host, current_path);
+                            std::println("[*] Following cross-domain redirect to: {}", current_host);
+                            redirects++;
+                            continue;
+                        } else if (res->status == 206 && res->has_header("Content-Range")) {
+                            std::string content_range = res->get_header_value("Content-Range");
+                            size_t slash_pos = content_range.find('/');
+                            if (slash_pos != std::string::npos) {
+                                file_size = std::stoll(content_range.substr(slash_pos + 1));
+                            }
+                            break;
+                        } else if (res->status == 200 && res->has_header("Content-Length")) {
+                            file_size = std::stoll(res->get_header_value("Content-Length"));
+                            break;
+                        } else {
+                            std::println("[*] Server returned HTTP {} for Range GET check.", res->status);
+                            break;
                         }
-                        break;
-                    } else if (res->status == 200 && res->has_header("Content-Length")) {
-                        file_size = std::stoll(res->get_header_value("Content-Length"));
-                        break;
                     } else {
-                        std::println("[*] Server returned HTTP {} for Range GET check.", res->status);
+                        std::println("[-] Range GET check failed due to network timeout.");
                         break;
                     }
-                } else {
-                    std::println("[-] Range GET check failed due to network timeout.");
-                    break;
                 }
-            }
 
-            if (file_size <= 0) {
-                std::println(stderr, "[-] Failed to retrieve Content-Length. Using dynamic cache bounds.");
-                file_size = 1024;
-            }
-        }
-
-        std::string base_url = final_url;
-        size_t query_pos = base_url.find('?');
-        if (query_pos != std::string::npos) base_url = base_url.substr(0, query_pos);
-
-        std::hash<std::string> hasher;
-        std::string stream_id = prefix + "_" + std::to_string(hasher(base_url));
-
-        std::string safe_name = base_url;
-        std::replace_if(safe_name.begin(), safe_name.end(), [](char c) { return !std::isalnum(c); }, '_');
-        if (safe_name.length() > 50) safe_name = safe_name.substr(safe_name.length() - 50);
-
-        std::string cache_path;
-        std::string hls_save_dir;
-
-        if (is_hls) {
-            hls_save_dir = config.save_dir + "/" + prefix + "_" + safe_name + "_hls";
-            std::error_code ec;
-            std::filesystem::create_directories(hls_save_dir, ec);
-            cache_path = hls_save_dir + "/dummy_cache.bin"; 
-        } else {
-            cache_path = config.save_dir + "/" + prefix + "_" + safe_name + ".bin";
-            
-            std::error_code ec;
-            if (std::filesystem::exists(cache_path, ec)) {
-                std::int64_t local_size = std::filesystem::file_size(cache_path, ec);
-                if (!ec && local_size != file_size) {
-                    std::println(stderr, "[-] CRITICAL: Size mismatch! Local cache is {} bytes, but remote link is {} bytes.", local_size, file_size);
-                    throw std::runtime_error("Size mismatch. The link has expired or points to a different file.");
+                if (file_size <= 0) {
+                    std::println(stderr, "[-] Failed to retrieve Content-Length. Using dynamic cache bounds.");
+                    file_size = 1024;
                 }
             }
         }
@@ -357,3 +373,4 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         return { "failed_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()), -1, cancel_token, finished_token };
     }
 }
+
