@@ -14,8 +14,10 @@
 std::vector<pid_t> active_players;
 std::mutex player_mtx;
 
-pid_t launch_player(const AppConfig& config, const std::string& stream_url, const std::string& abort_url, const std::string& audio_url) {
-    bool is_iso = (stream_url.find(".iso") != std::string::npos || 
+pid_t launch_player(const AppConfig& config, const std::string& stream_url, const std::string& abort_url, const std::string& audio_url, const std::string& file_path) {
+    bool is_iso = (file_path.find(".iso") != std::string::npos || 
+                   file_path.find(".ISO") != std::string::npos ||
+                   stream_url.find(".iso") != std::string::npos || 
                    stream_url.find(".ISO") != std::string::npos);
     
     std::string player_exec = is_iso ? "vlc" : config.player_path;

@@ -229,7 +229,7 @@ void handle_torrent(TorrentManager& manager, AppConfig& config, std::string sour
         std::println("  => [{}] {} ({} MB)", idx, files.file_path(lt::file_index_t(idx)), files.file_size(lt::file_index_t(idx)) / (1024 * 1024));
         std::println("     URL: {}", stream_url);
 
-        pid_t pid = launch_player(config, stream_url, abort_url, "");
+        pid_t pid = launch_player(config, stream_url, abort_url, "", state->file_path);
         state->player_pid = pid;
     }
     std::println("");
