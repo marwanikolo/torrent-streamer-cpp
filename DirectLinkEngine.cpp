@@ -273,19 +273,36 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 while (redirects < 5) {
                     httplib::Client cli(current_host);
                     cli.enable_server_certificate_verification(false); 
-                    cli.set_connection_timeout(5);
-                    cli.set_read_timeout(5);
+                    
+                    // --- FIX: Increased timeouts from 5s to 15s to account for CDN delay ---
+                    cli.set_connection_timeout(15);
+                    cli.set_read_timeout(15);
                     cli.set_follow_location(false); 
 
                     httplib::Headers req_headers = auth_headers; 
-                    req_headers.emplace("Range", "bytes=0-0");
+                    
+                    // --- FIX: Prevent silent drops on 0-byte range requests ---
+                    req_headers.emplace("Range", "bytes=0-1048575");
 
                     auto res = cli.Get(current_path.c_str(), req_headers);
                     
                     if (res) {
                         if (res->status >= 300 && res->status < 400 && res->has_header("Location")) {
                             std::string loc = res->get_header_value("Location");
-                            final_url = loc.starts_with("http") ? loc : current_host + loc;
+                            
+                            // --- FIX: Proper Redirect URL parsing ---
+                            if (loc.starts_with("http://") || loc.starts_with("https://")) {
+                                final_url = loc;
+                            } else if (loc.starts_with("//")) {
+                                final_url = (current_host.starts_with("https") ? "https:" : "http:") + loc;
+                            } else if (loc.starts_with("/")) {
+                                size_t path_pos = current_host.find('/', current_host.find("://") + 3);
+                                std::string root_host = (path_pos != std::string::npos) ? current_host.substr(0, path_pos) : current_host;
+                                final_url = root_host + loc;
+                            } else {
+                                final_url = current_host + "/" + loc;
+                            }
+                            
                             parse_url(final_url, current_host, current_path);
                             std::println("[*] Following cross-domain redirect to: {}", current_host);
                             redirects++;
@@ -311,8 +328,9 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
                 }
 
                 if (file_size <= 0) {
-                    std::println(stderr, "[-] Failed to retrieve Content-Length. Using dynamic cache bounds.");
-                    file_size = 1024;
+                    // --- FIX: Dynamic cache bounds set to 20 GB fallback ---
+                    std::println(stderr, "[-] Content-Length unavailable. Setting dynamic virtual cache bound (20 GB).");
+                    file_size = 20000000000LL;
                 }
             }
         }
@@ -373,4 +391,3 @@ DirectStreamHandle stream_direct_link(AppConfig& config, const std::string& url,
         return { "failed_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()), -1, cancel_token, finished_token };
     }
 }
-
